@@ -12,3 +12,9 @@ And yes, these are technically AI-slop.
 This is a script that allows you to sort your countries and enterprises in a customizable order on the portal page. I also made it so you can click and drag the ticker strip at the top of the pages that have them.
 
 ![Screenshot of the custom sort order UI on the main portal page.](https://github.com/WalkingGlitch/Simcountry/blob/main/Portaljs%20Example%20Screenshot.png)
+
+
+
+## Loan Offers
+This is a script that overhauls the loan offers UI to allow sorting of outstanding offers, highlighting of open offers over a certain amount, and submitting multiple loan offers with a single click.
+
