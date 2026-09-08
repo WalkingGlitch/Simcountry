@@ -18,4 +18,4 @@ This is a script that allows you to sort your countries and enterprises in a cus
 ## Loan Offers
 This is a script that overhauls the loan offers UI to allow sorting of outstanding offers, highlighting of open offers over a certain amount, and submitting multiple loan offers with a single click.
 
-![Screenshot of the overhauled loan offers page with customizable sorting, and multiple-submission.](https://github.com/WalkingGlitch/Simcountry/blob/main/LoanOffersjs%20Example%20Screenshot.png)
+![Screenshot of the overhauled loan offers page with customizable sorting, and multiple-submission.](https://github.com/WalkingGlitch/Simcountry/blob/b1b35fca2822bf4777bccca2eba3f3f4e147d95f/readmescreenshots/LoanOffersjs%20Example%20Screenshot.png)
