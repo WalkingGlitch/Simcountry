@@ -11,7 +11,7 @@ And yes, these are technically AI-slop.
 ## Portal.js
 This is a script that allows you to sort your countries and enterprises in a customizable order on the portal page. I also made it so you can click and drag the ticker strip at the top of the pages that have them.
 
-![Screenshot of the custom sort order UI on the main portal page.](https://github.com/WalkingGlitch/Simcountry/blob/main/Portaljs%20Example%20Screenshot.png)
+![Screenshot of the custom sort order UI on the main portal page.](https://github.com/WalkingGlitch/Simcountry/blob/5f45af07c4ba6e7e9d79e800654d046cd5518095/readmescreenshots/Portaljs%20Example%20Screenshot.png)
 
 
 
