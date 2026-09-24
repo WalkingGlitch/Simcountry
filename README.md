@@ -12,6 +12,7 @@ This repo is a small toolkit for people who already play. It does not replace th
 | --- | --- | --- |
 | [Loan Offers.js](Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
 | [Order Strategies](Order%20Strategies) | 1.4.0 | Select, filter, preset, and snapshot stock-order strategies |
+| [Salary Tweaks](Salary%20Tweaks) | 1.1.0 | Select, filter, and bulk-set state corporation salaries |
 | [Portal.js](Portal.js) | 1.3.0 | Reorder countries/enterprises and flick the news ticker |
 | [War Casualty Bookmarklet](3rd%20Party/War%20Casualty%20Bookmarklet.txt) | 3rd party | Summarize war losses from a battle report page |
 
@@ -30,6 +31,7 @@ Raw files:
 
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Loan%20Offers.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Order%20Strategies`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/Salary%20Tweaks`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Portal.js`
 
 Preferences are stored in Tampermonkey / `localStorage`. They stay on your machine.
@@ -91,6 +93,37 @@ Nothing is sent until you hit the site's own save button.
 
 ---
 
+## State Salary Toolbox
+
+**File:** [`Salary Tweaks`](Salary%20Tweaks) *(no `.js` extension; Tampermonkey still accepts it)*  
+**Userscript name:** Simcountry State Salary Toolbox  
+**Author:** TheWalkingGlitch  
+**Runs on:** Country → Corporations → **Salary Levels** (`statecmpsalaries` / `stateCmpSalariesSubmit`)
+
+Same idea as the order-strategy toolbox, pointed at the state salary grid. Checkboxes select corporations. Sorting and filters only reflow the live list. Apply writes the form fields; the site button **Set Salary Changes** is what actually saves.
+
+![Salary Toolbox floating panel with sort, filters, bulk apply, and named revisions](Salary%20Toolbox%20SS.png)
+
+### Features
+
+- Checkbox to the left of each product icon; checked rows highlight
+- Search by corporation name, plus category and product-type dropdowns
+- Range filters for current salary, target, welfare index, and hiring
+- Filter by strategy mode (target index vs increase)
+- Selection helpers: check visible, uncheck all, invert visible, check military / industry / civilian
+- Bulk apply to the checked set:
+  - **Target index** (default 300) or **Increase %**
+  - **Target 300** shortcut
+  - **Target = current** copies each corp's current salary into its target
+- Covers State Corporations, National Industries, and Country Controlled / Public Corporations on the same page
+- Named **revisions**: save all or only checked rows, restore later
+- Restore matches by corporation id first, then name + product, then unique name. Corps added after the snapshot are left alone.
+- Draggable, collapsible panel
+
+Nothing is sent until you hit **Set Salary Changes**.
+
+---
+
 ## Desktop Enhancer (Portal.js)
 
 **File:** [`Portal.js`](Portal.js)  
@@ -147,7 +180,9 @@ A bookmarklet, not a Tampermonkey script. It reads the attacker / defender repor
 Simcountry/
 ├── Loan Offers.js
 ├── Order Strategies
+├── Salary Tweaks
 ├── Portal.js
+├── Salary Toolbox SS.png
 ├── LICENSE
 ├── README.md
 ├── readmescreenshots/
@@ -164,7 +199,7 @@ Simcountry/
 - These scripts scrape and click the live site. A game update can break them overnight.
 - They are client-side only. They do not talk to a third-party server.
 - Batch loan submits reload the offer page once per offer, with a delay. Do not walk away from a 50-offer job if you care about the result.
-- Order-strategy revisions live in userscript storage. Export nothing you cannot rebuild.
+- Order-strategy and salary revisions live in userscript storage. Export nothing you cannot rebuild.
 - Portal sort order is local to that browser. It will not follow you to another machine.
 - Unofficial tools can sit in a grey area of a game's rules. If Simcountry says no, stop.
 
