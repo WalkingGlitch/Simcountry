@@ -12,7 +12,7 @@ This repo is a small toolkit for people who already play. It does not replace th
 | --- | --- | --- |
 | [Loan Offers.js](Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
 | [Order Strategies](Order%20Strategies) | 1.4.0 | Select, filter, preset, and snapshot stock-order strategies |
-| [Portal.js](#portaljs-not-checked-in-yet) | — | Custom portal sort order + draggable ticker *(screenshot is here; script file is not)* |
+| [Portal.js](Portal.js) | 1.3.0 | Reorder countries/enterprises and flick the news ticker |
 | [War Casualty Bookmarklet](3rd%20Party/War%20Casualty%20Bookmarklet.txt) | 3rd party | Summarize war losses from a battle report page |
 
 > Unofficial. Not affiliated with Simcountry or its operators. Use at your own risk, and stay inside the game's rules.
@@ -30,6 +30,7 @@ Raw files:
 
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Loan%20Offers.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Order%20Strategies`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/Portal.js`
 
 Preferences are stored in Tampermonkey / `localStorage`. They stay on your machine.
 
@@ -90,18 +91,38 @@ Nothing is sent until you hit the site's own save button.
 
 ---
 
-## Portal.js (not checked in yet)
+## Desktop Enhancer (Portal.js)
 
-The README screenshot and the original description are in this repo. The script file itself is not on `main` right now.
+**File:** [`Portal.js`](Portal.js)  
+**Userscript name:** Simcountry Desktop Enhancer  
+**Author:** TheWalkingGlitch  
+**Runs on:** the portal widgets *My Countries* / *My Enterprises*, and any page that still has the scrolling news ticker
 
-Intended behavior, from the existing notes:
-
-- Custom sort order for countries and enterprises on the portal page
-- Click-and-drag the ticker strip on pages that have one
+Drag the country and enterprise tiles into the order you actually use, or pick a named sort. The ticker can be grabbed and flung instead of only auto-scrolling.
 
 ![Custom sort order UI on the main portal page](readmescreenshots/Portaljs%20Example%20Screenshot.png)
 
-If you have a local copy, drop it in the repo root as `Portal.js` and this section can grow a real install link.
+### Widget features
+
+- Drag-reorder tiles on **My Countries** and **My Enterprises**
+- Sort dropdowns:
+  - Custom (drag order)
+  - Name A → Z / Z → A
+  - World, then name
+  - World Z → A, then name
+  - Page default
+- Reset button restores the page's original order
+- New countries or enterprises get appended to a saved custom order instead of wiping it
+- Worlds are recognized from the usual hosts (Kebir Blue, Fearless Blue, White Giant, Golden Rainbow, Little Upsilon, Tiny Atlas)
+
+### Ticker features
+
+- Click and drag the ticker strip; release to let it coast
+- Native auto-scroll pauses while you are flicking it, then resumes after a short idle
+- **Ticker** button opens motion settings: enabled, acceleration, motion factor, friction, max speed, invert drag
+- Defaults restore from that same panel
+
+Order and ticker prefs live in `localStorage` under `scEnhancer.v1`. From the console: `scEnhancer.reset()` clears them and reloads.
 
 ---
 
@@ -126,6 +147,7 @@ A bookmarklet, not a Tampermonkey script. It reads the attacker / defender repor
 Simcountry/
 ├── Loan Offers.js
 ├── Order Strategies
+├── Portal.js
 ├── LICENSE
 ├── README.md
 ├── readmescreenshots/
@@ -143,6 +165,7 @@ Simcountry/
 - They are client-side only. They do not talk to a third-party server.
 - Batch loan submits reload the offer page once per offer, with a delay. Do not walk away from a 50-offer job if you care about the result.
 - Order-strategy revisions live in userscript storage. Export nothing you cannot rebuild.
+- Portal sort order is local to that browser. It will not follow you to another machine.
 - Unofficial tools can sit in a grey area of a game's rules. If Simcountry says no, stop.
 
 ---
@@ -159,7 +182,6 @@ Copy, modify, ship, or ignore with or without credit. The software is provided *
 
 Issues and PRs are welcome, especially:
 
-- `Portal.js` actually landing in the tree
 - Game-page selectors that drifted after a Simcountry update
 - Safer defaults for repeat-submit and quality clamps
 
