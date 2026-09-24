@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simcountry State Salary Toolbox
 // @namespace    https://simcountry.com/userscripts/state-salaries
-// @version      1.0.0
+// @version      1.1.0
 // @description  Select, sort, and filter state corporation salaries; bulk-set target or increase; save named revisions.
 // @author       TheWalkingGlitch
 // @match        https://*.simcountry.com/cgi-bin/*
@@ -67,7 +67,9 @@
     filterWelMax: '',
     filterHireMin: '',
     filterHireMax: '',
-    filterMode: 'any'
+    filterMode: 'any',
+    filterCategory: 'any',
+    filterProduct: 'any'
   };
 
   function pageWin() {
@@ -147,7 +149,10 @@
     #sc-sal-root input[type="number"] { width: 52px; }
     #sc-sal-root input.sc-sal-mini { width: 40px; }
     #sc-sal-root select { max-width: 160px; }
-    #sc-sal-root select#sc-sal-revlist { width: 100%; max-width: none; }
+    #sc-sal-root select.sc-sal-wide,
+    #sc-sal-root select#sc-sal-revlist,
+    #sc-sal-root select#sc-sal-fcat,
+    #sc-sal-root select#sc-sal-fprod { width: 100%; max-width: none; }
     #sc-sal-root input[type="text"]#sc-sal-search,
     #sc-sal-root input[type="text"]#sc-sal-revname { width: 100%; }
     .sc-sal-chips { display: flex; flex-wrap: wrap; gap: 3px; margin: 4px 0; }
@@ -438,23 +443,41 @@
     return (root.querySelector('#sc-sal-search').value || '').trim().toLowerCase();
   }
 
-  function activeChips(root, sel) {
-    const on = [];
-    root.querySelectorAll(sel + '[data-on="1"]').forEach(function (ch) {
-      on.push(ch.getAttribute('data-val'));
-    });
-    return on;
+  function categoryLabel(key) {
+    const names = {
+      offensive: 'Offensive',
+      defensive: 'Defensive',
+      strategic: 'Strategic',
+      industry: 'Industry',
+      mining: 'Mining',
+      hightech: 'High Tech',
+      construction: 'Construction',
+      spaceindustry: 'Space',
+      food: 'Food',
+      agriculture: 'Agriculture',
+      recreation: 'Recreation',
+      services: 'Services',
+      utilities: 'Utilities',
+      government: 'Government'
+    };
+    return names[key] || key;
+  }
+
+  function matchesCategory(c, token) {
+    if (!token || token === 'any') return true;
+    if (token.indexOf('group:') === 0) return c.group === token.slice(6);
+    if (token.indexOf('icon:') === 0) return c.iconKey === token.slice(5);
+    if (token.indexOf('section:') === 0) return c.section === token.slice(8);
+    return c.iconKey === token || c.group === token || c.section === token;
   }
 
   function matchesView(c, root) {
     const q = searchNeedle(root);
     if (q && (c.name + ' ' + c.product + ' ' + c.section + ' ' + c.id).toLowerCase().indexOf(q) === -1) return false;
-    const types = activeChips(root, '#sc-sal-types .sc-sal-chip');
-    if (types.length && types.indexOf(c.product) === -1) return false;
-    const secs = activeChips(root, '#sc-sal-secs .sc-sal-chip');
-    if (secs.length && secs.indexOf(c.section) === -1) return false;
-    const groups = activeChips(root, '#sc-sal-groups .sc-sal-chip');
-    if (groups.length && groups.indexOf(c.group) === -1) return false;
+    const cat = (root.querySelector('#sc-sal-fcat') || {}).value || 'any';
+    if (!matchesCategory(c, cat)) return false;
+    const prod = (root.querySelector('#sc-sal-fprod') || {}).value || 'any';
+    if (prod !== 'any' && c.product !== prod) return false;
     const modeF = (root.querySelector('#sc-sal-fmode') || {}).value || 'any';
     if (modeF !== 'any' && currentMode(c) !== modeF) return false;
     const curMin = emptyToNull(root.querySelector('#sc-sal-fcmin') && root.querySelector('#sc-sal-fcmin').value);
@@ -526,15 +549,6 @@
 
   function buildPanel(form, corps) {
     if (document.getElementById('sc-sal-root')) return;
-    const types = {};
-    const secs = {};
-    corps.forEach(function (c) {
-      types[c.product] = (types[c.product] || 0) + 1;
-      secs[c.section] = (secs[c.section] || 0) + 1;
-    });
-    const typeNames = Object.keys(types).sort();
-    const secNames = Object.keys(secs);
-
     function opt(val, label, cur) {
       return '<option value="' + val + '"' + (cur === val ? ' selected' : '') + '>' + label + '</option>';
     }
@@ -569,22 +583,11 @@
               opt('desc', 'Desc', settings.sortDir) +
             '</select>' +
           '</div>' +
-          '<input type="text" id="sc-sal-search" placeholder="Filter by name or product…" autocomplete="off">' +
-          '<div class="sc-sal-chips" id="sc-sal-secs">' +
-            secNames.map(function (s) {
-              return '<button type="button" class="sc-sal-chip" data-val="' + s.replace(/"/g, '') + '">' + s + ' ' + secs[s] + '</button>';
-            }).join('') +
-          '</div>' +
-          '<div class="sc-sal-chips" id="sc-sal-groups">' +
-            '<button type="button" class="sc-sal-chip" data-val="military">Military</button>' +
-            '<button type="button" class="sc-sal-chip" data-val="industry">Industry</button>' +
-            '<button type="button" class="sc-sal-chip" data-val="civilian">Civilian</button>' +
-          '</div>' +
-          '<div class="sc-sal-chips" id="sc-sal-types">' +
-            typeNames.map(function (t) {
-              return '<button type="button" class="sc-sal-chip" data-val="' + t.replace(/"/g, '&quot;') + '">' + t + ' ' + types[t] + '</button>';
-            }).join('') +
-          '</div>' +
+          '<input type="text" id="sc-sal-search" placeholder="Filter by corporation name…" autocomplete="off">' +
+          '<div class="sc-sal-row"><label style="width:100%;">Category' +
+            '<select class="sc-sal-wide" id="sc-sal-fcat"></select></label></div>' +
+          '<div class="sc-sal-row"><label style="width:100%;">Product type' +
+            '<select class="sc-sal-wide" id="sc-sal-fprod"></select></label></div>' +
           '<div class="sc-sal-row">' +
             '<label>Cur <input class="sc-sal-mini" type="number" id="sc-sal-fcmin" placeholder="min" value="' + settings.filterCurMin + '"></label>' +
             '<label>– <input class="sc-sal-mini" type="number" id="sc-sal-fcmax" placeholder="max" value="' + settings.filterCurMax + '"></label>' +
@@ -662,6 +665,8 @@
       '</div>';
 
     document.body.appendChild(root);
+    fillCategorySelect(root, corps);
+    fillProductSelect(root, corps);
     fillRevisionSelect(root);
     wirePanel(root, form, corps);
     makeDraggable(root, root.querySelector('#sc-sal-drag'));
@@ -693,7 +698,83 @@
     settings.filterHireMin = root.querySelector('#sc-sal-fhmin').value;
     settings.filterHireMax = root.querySelector('#sc-sal-fhmax').value;
     settings.filterMode = root.querySelector('#sc-sal-fmode').value;
+    settings.filterCategory = (root.querySelector('#sc-sal-fcat') || {}).value || 'any';
+    settings.filterProduct = (root.querySelector('#sc-sal-fprod') || {}).value || 'any';
     saveSettings();
+  }
+
+  function fillCategorySelect(root, corps) {
+    const sel = root.querySelector('#sc-sal-fcat');
+    if (!sel) return;
+    const icons = {};
+    const secs = {};
+    const groups = { military: 0, industry: 0, civilian: 0, other: 0 };
+    corps.forEach(function (c) {
+      icons[c.iconKey] = (icons[c.iconKey] || 0) + 1;
+      secs[c.section] = (secs[c.section] || 0) + 1;
+      groups[c.group] = (groups[c.group] || 0) + 1;
+    });
+    function add(value, label) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      sel.appendChild(o);
+    }
+    function group(label) {
+      const g = document.createElement('optgroup');
+      g.label = label;
+      sel.appendChild(g);
+      return g;
+    }
+    function addG(g, value, label) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      g.appendChild(o);
+    }
+    sel.innerHTML = '';
+    add('any', 'All categories');
+    const g1 = group('Groups');
+    ['military', 'industry', 'civilian'].forEach(function (k) {
+      if (groups[k]) addG(g1, 'group:' + k, k.charAt(0).toUpperCase() + k.slice(1) + ' (' + groups[k] + ')');
+    });
+    const g2 = group('Product categories');
+    Object.keys(icons).sort().forEach(function (k) {
+      addG(g2, 'icon:' + k, categoryLabel(k) + ' (' + icons[k] + ')');
+    });
+    const g3 = group('Lists');
+    Object.keys(secs).forEach(function (s) {
+      addG(g3, 'section:' + s, s + ' (' + secs[s] + ')');
+    });
+    if (settings.filterCategory && sel.querySelector('option[value="' + settings.filterCategory.replace(/"/g, '\\"') + '"]')) {
+      sel.value = settings.filterCategory;
+    }
+  }
+
+  function fillProductSelect(root, corps) {
+    const sel = root.querySelector('#sc-sal-fprod');
+    if (!sel) return;
+    const keep = sel.value || settings.filterProduct || 'any';
+    const cat = (root.querySelector('#sc-sal-fcat') || {}).value || 'any';
+    const counts = {};
+    corps.forEach(function (c) {
+      if (!matchesCategory(c, cat)) return;
+      counts[c.product] = (counts[c.product] || 0) + 1;
+    });
+    const names = Object.keys(counts).sort();
+    sel.innerHTML = '';
+    const any = document.createElement('option');
+    any.value = 'any';
+    any.textContent = 'All product types (' + names.reduce(function (n, k) { return n + counts[k]; }, 0) + ')';
+    sel.appendChild(any);
+    names.forEach(function (name) {
+      const o = document.createElement('option');
+      o.value = name;
+      o.textContent = name + ' (' + counts[name] + ')';
+      sel.appendChild(o);
+    });
+    if (keep && sel.querySelector('option[value="' + keep.replace(/"/g, '\\"') + '"]')) sel.value = keep;
+    else sel.value = 'any';
   }
 
   function say(text) {
@@ -758,7 +839,8 @@
 
     ['#sc-sal-search', '#sc-sal-sort', '#sc-sal-dir', '#sc-sal-fmode',
       '#sc-sal-fcmin', '#sc-sal-fcmax', '#sc-sal-ftmin', '#sc-sal-ftmax',
-      '#sc-sal-fwmin', '#sc-sal-fwmax', '#sc-sal-fhmin', '#sc-sal-fhmax'
+      '#sc-sal-fwmin', '#sc-sal-fwmax', '#sc-sal-fhmin', '#sc-sal-fhmax',
+      '#sc-sal-fprod'
     ].forEach(function (sid) {
       const el = root.querySelector(sid);
       if (!el) return;
@@ -766,15 +848,13 @@
       el.addEventListener('change', relist);
     });
 
-    root.querySelectorAll('.sc-sal-chips').forEach(function (wrap) {
-      wrap.addEventListener('click', function (ev) {
-        const chip = ev.target.closest('.sc-sal-chip');
-        if (!chip) return;
-        chip.dataset.on = chip.dataset.on === '1' ? '0' : '1';
-        flowPageList(corps, root);
-        refreshCount(corps);
+    const catSel = root.querySelector('#sc-sal-fcat');
+    if (catSel) {
+      catSel.addEventListener('change', function () {
+        fillProductSelect(root, corps);
+        relist();
       });
-    });
+    }
 
     form.addEventListener('change', function (ev) {
       if (ev.target && ev.target.classList && ev.target.classList.contains('sc-sal-pick')) {
