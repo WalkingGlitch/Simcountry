@@ -1,0 +1,1193 @@
+// ==UserScript==
+// @name         Simcountry Order Strategy Toolbox
+// @namespace    https://simcountry.com/userscripts/order-strategies
+// @version      1.4.0
+// @description  Checkbox-select products on Stock Order Strategies, filter/sort the live list, save named revisions, and fill quality / order fields after confirm.
+// @author       TheWalkingGlitch
+// @match        https://*.simcountry.com/cgi-bin/*
+// @match        http://*.simcountry.com/cgi-bin/*
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
+// @run-at       document-end
+// ==/UserScript==
+
+/*
+  INSTALL: Tampermonkey → New script → paste → save.
+  Open Country → Trade → Order Strategies (form name fSOS).
+
+  Selection is ONLY the checkbox to the left of the industry icon.
+  Sorting reorders those same rows on the page and does not change checks.
+
+  Fields written: miOS / miT / miQ / miQS / miL and stockstrategies[id].
+  Quality clamp: 120–330. Save with the site button.
+
+  Revisions are stored under scOstRevisions.v1 as named snapshots keyed by
+  product id, with name+category fallback so new products/industries are
+  skipped on restore instead of breaking older saves.
+*/
+
+(function () {
+  'use strict';
+
+  const STORAGE_KEY = 'scOstToolbox.v3';
+  const REVISIONS_KEY = 'scOstRevisions.v1';
+  const REVISION_FORMAT = 1;
+  const Q_MIN = 120;
+  const Q_MAX = 330;
+  const INIT_FLAG = 'scOstToolboxInit';
+
+  const CATEGORY_META = {
+    offensive: { label: 'Offensive', group: 'military' },
+    defensive: { label: 'Defensive', group: 'military' },
+    strategic: { label: 'Strategic', group: 'military' },
+    industry: { label: 'Industry', group: 'industry' },
+    mining: { label: 'Mining', group: 'industry' },
+    hightech: { label: 'High Tech', group: 'industry' },
+    construction: { label: 'Construction', group: 'industry' },
+    spaceindustry: { label: 'Space', group: 'industry' },
+    food: { label: 'Food', group: 'civilian' },
+    agriculture: { label: 'Agriculture', group: 'civilian' },
+    recreation: { label: 'Recreation', group: 'civilian' },
+    services: { label: 'Services', group: 'civilian' },
+    utilities: { label: 'Utilities', group: 'civilian' },
+    government: { label: 'Government', group: 'civilian' }
+  };
+
+  const DEFAULTS = {
+    panelOpen: true,
+    lowWater: 3,
+    orderMonths: 14,
+    quality: 160,
+    offsetQ: 10,
+    osMode: 'auto',
+    sortKey: 'original',
+    sortDir: 'asc',
+    filterQMin: '',
+    filterQMax: '',
+    filterLwMin: '',
+    filterLwMax: '',
+    filterOqMin: '',
+    filterOqMax: '',
+    filterOs: 'any'
+  };
+
+  function pageWin() {
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow.document) return unsafeWindow;
+    } catch (e) { /* isolated world */ }
+    return window;
+  }
+
+  function gmGet(key, fallback) {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(key, fallback);
+    } catch (e) { /* ignore */ }
+    try {
+      const raw = localStorage.getItem(key);
+      return raw == null ? fallback : JSON.parse(raw);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function gmSet(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(key, value);
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+  }
+
+  const settings = Object.assign({}, DEFAULTS, gmGet(STORAGE_KEY, null) || {});
+
+  function saveSettings() {
+    gmSet(STORAGE_KEY, settings);
+  }
+
+  function addStyle(css) {
+    if (typeof GM_addStyle === 'function') GM_addStyle(css);
+    else {
+      const el = document.createElement('style');
+      el.textContent = css;
+      document.documentElement.appendChild(el);
+    }
+  }
+
+  addStyle(`
+    #sc-ost-root {
+      position: fixed;
+      top: 64px;
+      right: 8px;
+      z-index: 2147483000;
+      width: 248px;
+      max-height: calc(100vh - 76px);
+      overflow: auto;
+      font: 11px/1.3 Arial, Helvetica, sans-serif;
+      color: #111;
+      background: #f3f6ff;
+      border: 1px solid #2a3a7a;
+      box-shadow: 0 6px 18px rgba(0,0,0,.25);
+      border-radius: 4px;
+    }
+    #sc-ost-root.sc-ost-collapsed { width: auto; max-height: none; overflow: visible; }
+    #sc-ost-root.sc-ost-collapsed .sc-ost-body { display: none; }
+    #sc-ost-root * { box-sizing: border-box; }
+    #sc-ost-root h3, #sc-ost-root h4 { margin: 0; }
+    .sc-ost-head {
+      display: flex; align-items: center; justify-content: space-between;
+      background: #1d4f9c; color: #fff; padding: 4px 6px; cursor: move; user-select: none;
+    }
+    .sc-ost-head h3 { font-size: 11px; font-weight: 700; }
+    .sc-ost-head button {
+      background: #0f2f66; color: #fff; border: 1px solid #9bb6e6;
+      border-radius: 2px; cursor: pointer; padding: 0 5px; font-size: 12px;
+    }
+    .sc-ost-body { padding: 6px 7px 8px; }
+    .sc-ost-help { color: #445; font-size: 10px; margin: 0 0 5px; }
+    .sc-ost-row { display: flex; gap: 4px; align-items: center; margin: 3px 0; flex-wrap: wrap; }
+    .sc-ost-row label { display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+    #sc-ost-root input[type="number"],
+    #sc-ost-root input[type="text"],
+    #sc-ost-root select {
+      font-size: 11px; padding: 1px 3px; border: 1px solid #7a88b0; border-radius: 2px;
+    }
+    #sc-ost-root input[type="number"] { width: 52px; }
+    #sc-ost-root input.sc-ost-mini { width: 40px; }
+    #sc-ost-root select { max-width: 148px; }
+    #sc-ost-root select#sc-ost-revlist { width: 100%; max-width: none; }
+    #sc-ost-root input[type="text"]#sc-ost-search,
+    #sc-ost-root input[type="text"]#sc-ost-revname { width: 100%; }
+    .sc-ost-chips { display: flex; flex-wrap: wrap; gap: 3px; margin: 4px 0; }
+    .sc-ost-chip {
+      border: 1px solid #4b5d99; background: #fff; color: #1a2a55;
+      border-radius: 999px; padding: 0 6px; cursor: pointer; font-size: 10px; line-height: 16px;
+    }
+    .sc-ost-chip[data-on="1"] { background: #1d4f9c; color: #fff; }
+    .sc-ost-actions { display: flex; flex-wrap: wrap; gap: 3px; margin: 4px 0; }
+    #sc-ost-root button.sc-btn {
+      background: #2d6bcd; color: #fff; border: 0; border-radius: 2px;
+      padding: 3px 6px; cursor: pointer; font-size: 10px;
+    }
+    #sc-ost-root button.sc-btn:hover { background: #1d4f9c; }
+    #sc-ost-root button.sc-btn.alt { background: #4b5d99; }
+    #sc-ost-root button.sc-btn.ok { background: #2a7a3a; }
+    .sc-ost-section { border-top: 1px solid #c5cbe0; margin-top: 6px; padding-top: 5px; }
+    .sc-ost-section h4 { font-size: 11px; color: #1d4f9c; margin-bottom: 3px; }
+    .sc-ost-status { background: #e7edff; border: 1px dashed #7a88b0; padding: 3px 5px; margin-top: 5px; }
+
+    /* Keep the original one-line row: checkbox + 16px icon on one nowrap cell */
+    form[name="fSOS"] td.sc-ost-iconcell {
+      white-space: nowrap !important;
+      vertical-align: middle;
+    }
+    form[name="fSOS"] input.sc-ost-pick {
+      width: 13px;
+      height: 13px;
+      margin: 0 4px 0 0;
+      padding: 0;
+      vertical-align: middle;
+    }
+    form[name="fSOS"] td.sc-ost-iconcell img {
+      vertical-align: middle;
+      display: inline;
+    }
+    form[name="fSOS"] tr.sc-ost-selected > td { background-color: #d4e4ff !important; }
+    form[name="fSOS"] tr.sc-ost-sorted-hide { display: none !important; }
+  `);
+
+  function pageMatches() {
+    const form = document.forms.namedItem('fSOS') || document.querySelector('form[name="fSOS"]');
+    if (!form) return false;
+    const method = form.querySelector('input[name="SN_METHOD"]');
+    if (method && /stockorderstrategies/i.test(method.value)) return true;
+    return !!form.querySelector('input[name^="miT"]') && !!form.querySelector('input[name^="miL"]');
+  }
+
+  function findForm() {
+    return document.forms.namedItem('fSOS') || document.querySelector('form[name="fSOS"]');
+  }
+
+  function num(text) {
+    const v = parseFloat(String(text == null ? '' : text).replace(/,/g, '').replace(/[^\d.-]/g, ''));
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function clampQ(v) {
+    const n = Math.round(num(v));
+    if (!Number.isFinite(n)) return Q_MIN;
+    return Math.min(Q_MAX, Math.max(Q_MIN, n));
+  }
+
+  function productIdFromName(name) {
+    const m = String(name || '').match(/^(?:miT|miQ|miL|miOS|miQS|miCSEL|miQSEL)(\d+)$/);
+    return m ? m[1] : null;
+  }
+
+  function stratFor(id) {
+    const w = pageWin();
+    try {
+      if (w.stockstrategies && w.stockstrategies['' + id]) return w.stockstrategies['' + id];
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function normName(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function loadRevisions() {
+    const raw = gmGet(REVISIONS_KEY, null);
+    if (!raw || typeof raw !== 'object') return { format: REVISION_FORMAT, items: [] };
+    const items = Array.isArray(raw.items) ? raw.items : [];
+    return { format: REVISION_FORMAT, items: items };
+  }
+
+  function storeRevisions(pack) {
+    gmSet(REVISIONS_KEY, {
+      format: REVISION_FORMAT,
+      items: pack.items || []
+    });
+  }
+
+  function currentOSMode(form, p) {
+    const el = form.querySelector('input[name="miOS' + p.id + '"]:checked');
+    return el ? String(el.value) : '0';
+  }
+
+  function currentQSMode(form, p) {
+    const el = form.querySelector('input[name="miQS' + p.id + '"]:checked');
+    return el ? String(el.value) : '2';
+  }
+
+  function fieldQuality(p) {
+    if (!p.l) return null;
+    if (p.l.disabled || p.l.value === 'any' || p.l.value === '') return null;
+    return clampQ(p.l.value);
+  }
+
+  function fieldLW(p) {
+    return p.t ? num(p.t.value) : 0;
+  }
+
+  function fieldOQ(p) {
+    return p.q ? num(p.q.value) : 0;
+  }
+
+  function snapshotProduct(form, p) {
+    return {
+      id: String(p.id),
+      name: p.name,
+      nameKey: normName(p.name),
+      category: p.category,
+      os: currentOSMode(form, p),
+      lowWater: fieldLW(p),
+      orderQty: fieldOQ(p),
+      qs: currentQSMode(form, p),
+      quality: fieldQuality(p),
+      requestQuality: currentQSMode(form, p) !== '1'
+    };
+  }
+
+  function buildIndexes(products) {
+    const byId = new Map();
+    const byNameCat = new Map();
+    const byName = new Map();
+    products.forEach(function (p) {
+      byId.set(String(p.id), p);
+      const nk = normName(p.name);
+      byNameCat.set(nk + '\t' + p.category, p);
+      if (!byName.has(nk)) byName.set(nk, []);
+      byName.get(nk).push(p);
+    });
+    return { byId: byId, byNameCat: byNameCat, byName: byName };
+  }
+
+  // Forward-compatible match: id first, then name+category, then unique name.
+  // New page products with no snapshot stay untouched. Missing saved ids are skipped.
+  function matchSnapshot(snap, indexes) {
+    if (!snap) return null;
+    if (snap.id != null && indexes.byId.has(String(snap.id))) return indexes.byId.get(String(snap.id));
+    const nk = snap.nameKey || normName(snap.name);
+    if (nk && snap.category && indexes.byNameCat.has(nk + '\t' + snap.category)) {
+      return indexes.byNameCat.get(nk + '\t' + snap.category);
+    }
+    if (nk && indexes.byName.has(nk)) {
+      const hits = indexes.byName.get(nk);
+      if (hits.length === 1) return hits[0];
+    }
+    return null;
+  }
+
+  function emptyToNull(v) {
+    if (v == null) return null;
+    const s = String(v).trim();
+    if (s === '') return null;
+    const n = num(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function inRange(value, minV, maxV) {
+    if (minV != null && value < minV) return false;
+    if (maxV != null && value > maxV) return false;
+    return true;
+  }
+
+  function collectProducts(form) {
+    const map = new Map();
+    let index = 0;
+    form.querySelectorAll('input[name^="miT"]').forEach((inp) => {
+      const id = productIdFromName(inp.name);
+      if (!id) return;
+      const row = inp.closest('tr');
+      if (!row) return;
+      const nameLink = row.querySelector('a[onclick*="productinfo"], a.popup.gadgetlink');
+      const catImg = row.querySelector('td img[alt], img[alt]');
+      const useCells = row.querySelectorAll('td.data[title]');
+      const category = ((catImg && catImg.getAttribute('alt')) || 'other').toLowerCase();
+      const monthlyUse = useCells[0] ? num(useCells[0].textContent) : 0;
+      const stock = useCells[1] ? num(useCells[1].textContent) : 0;
+      map.set(id, {
+        id: id,
+        origIndex: index++,
+        row: row,
+        name: nameLink ? nameLink.textContent.replace(/\s+/g, ' ').trim() : ('Product ' + id),
+        category: category,
+        group: (CATEGORY_META[category] || {}).group || 'other',
+        monthlyUse: monthlyUse,
+        stock: stock,
+        hasMonths: !!form.querySelector('input[name="miOS' + id + '"][value="1"]'),
+        t: form.querySelector('input[name="miT' + id + '"]'),
+        q: form.querySelector('input[name="miQ' + id + '"]'),
+        l: form.querySelector('input[name="miL' + id + '"]'),
+        csel: form.querySelector('input[name="miCSEL' + id + '"]'),
+        qsel: form.querySelector('input[name="miQSEL' + id + '"]'),
+        pick: null
+      });
+    });
+    return map;
+  }
+
+  function installPickboxes(products) {
+    products.forEach(function (p) {
+      if (p.row.querySelector('input.sc-ost-pick')) {
+        p.pick = p.row.querySelector('input.sc-ost-pick');
+        return;
+      }
+      const iconTd = p.row.querySelector('td');
+      if (!iconTd) return;
+      iconTd.classList.add('sc-ost-iconcell');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.className = 'sc-ost-pick';
+      box.value = '1';
+      box.title = 'Select ' + p.name + ' for toolbox actions';
+      box.setAttribute('data-sc-pid', p.id);
+      iconTd.insertBefore(box, iconTd.firstChild);
+      p.pick = box;
+      p.row.setAttribute('data-sc-pid', p.id);
+    });
+  }
+
+  function isSelected(p) {
+    return !!(p.pick && p.pick.checked);
+  }
+
+  function setSelected(p, on) {
+    if (p.pick) p.pick.checked = !!on;
+    if (p.row) p.row.classList.toggle('sc-ost-selected', !!on);
+  }
+
+  function selectedList(products) {
+    const out = [];
+    products.forEach(function (p) {
+      if (isSelected(p)) out.push(p);
+    });
+    return out;
+  }
+
+  function syncSelectedClass(products) {
+    products.forEach(function (p) {
+      if (p.row) p.row.classList.toggle('sc-ost-selected', isSelected(p));
+    });
+  }
+
+  function currentQuality(p) {
+    if (!p.l) return Q_MIN;
+    if (p.l.value === 'any' || p.l.disabled) {
+      const strat = stratFor(p.id);
+      if (strat && num(strat.orderQuality) > 0) return clampQ(strat.orderQuality);
+      return Q_MIN;
+    }
+    return clampQ(p.l.value);
+  }
+
+  function setRadio(form, name, value) {
+    const el = form.querySelector('input[name="' + name + '"][value="' + value + '"]');
+    if (!el) return null;
+    el.checked = true;
+    return el;
+  }
+
+  function enableField(el) {
+    if (!el) return;
+    el.disabled = false;
+    el.removeAttribute('disabled');
+  }
+
+  function writeInput(el, value) {
+    if (!el) return;
+    enableField(el);
+    el.value = String(value);
+    try {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) { /* old browsers */ }
+  }
+
+  function applyOrder(form, p, mode, lowWater, orderQty) {
+    let use = String(mode);
+    if (use === 'auto') use = p.hasMonths ? '1' : '2';
+    if (use === '1' && !p.hasMonths) use = '2';
+
+    const radio = setRadio(form, 'miOS' + p.id, use);
+    if (!radio && use !== '0') {
+      setRadio(form, 'miOS' + p.id, '2');
+      use = '2';
+    }
+    if (p.csel && use !== '0') p.csel.checked = true;
+
+    const strat = stratFor(p.id);
+    const lw = Math.max(0, Math.round(num(lowWater)));
+    const oq = Math.max(0, Math.round(num(orderQty)));
+
+    if (strat) {
+      strat.prevStrategy = use;
+      strat.orderStrategy = use;
+      if (use === '2') {
+        strat.lowWaterUnits = lw;
+        strat.orderQuantityUnits = oq;
+      } else if (use === '1') {
+        strat.lowWaterMonths = lw;
+        strat.orderQuantityMonths = oq;
+      }
+    }
+
+    if (use === '0') {
+      if (p.t) p.t.disabled = true;
+      if (p.q) p.q.disabled = true;
+    } else {
+      writeInput(p.t, lw);
+      writeInput(p.q, oq);
+    }
+    return use;
+  }
+
+  function applyQuality(form, p, quality, request) {
+    const qv = clampQ(quality);
+    if (p.qsel) p.qsel.checked = true;
+    const strat = stratFor(p.id);
+    if (strat) strat.orderQuality = qv;
+    if (!request) {
+      setRadio(form, 'miQS' + p.id, '1');
+      if (p.l) {
+        p.l.value = 'any';
+        p.l.disabled = true;
+      }
+      return qv;
+    }
+    setRadio(form, 'miQS' + p.id, '2');
+    writeInput(p.l, qv);
+    return qv;
+  }
+
+  function searchNeedle(root) {
+    return (root.querySelector('#sc-ost-search').value || '').trim().toLowerCase();
+  }
+
+  function matchesSearch(p, q) {
+    if (!q) return true;
+    return (p.name + ' ' + p.category + ' ' + p.id).toLowerCase().indexOf(q) !== -1;
+  }
+
+  function activeCats(root) {
+    const on = [];
+    root.querySelectorAll('.sc-ost-chip[data-on="1"]').forEach(function (ch) {
+      on.push(ch.getAttribute('data-cat'));
+    });
+    return on;
+  }
+
+  function filterBounds(root) {
+    return {
+      qMin: emptyToNull(root.querySelector('#sc-ost-fqmin') && root.querySelector('#sc-ost-fqmin').value),
+      qMax: emptyToNull(root.querySelector('#sc-ost-fqmax') && root.querySelector('#sc-ost-fqmax').value),
+      lwMin: emptyToNull(root.querySelector('#sc-ost-flwmin') && root.querySelector('#sc-ost-flwmin').value),
+      lwMax: emptyToNull(root.querySelector('#sc-ost-flwmax') && root.querySelector('#sc-ost-flwmax').value),
+      oqMin: emptyToNull(root.querySelector('#sc-ost-foqmin') && root.querySelector('#sc-ost-foqmin').value),
+      oqMax: emptyToNull(root.querySelector('#sc-ost-foqmax') && root.querySelector('#sc-ost-foqmax').value),
+      os: (root.querySelector('#sc-ost-fos') || {}).value || 'any'
+    };
+  }
+
+  function matchesSortView(p, root) {
+    if (!matchesSearch(p, searchNeedle(root))) return false;
+    const cats = activeCats(root);
+    if (cats.length && cats.indexOf(p.category) === -1) return false;
+    const f = filterBounds(root);
+    const form = findForm();
+    const os = form ? currentOSMode(form, p) : '0';
+    if (f.os !== 'any' && os !== f.os) return false;
+    const qv = fieldQuality(p);
+    if (f.qMin != null || f.qMax != null) {
+      if (qv == null) return false;
+      if (!inRange(qv, f.qMin, f.qMax)) return false;
+    }
+    if (!inRange(fieldLW(p), f.lwMin, f.lwMax)) return false;
+    if (!inRange(fieldOQ(p), f.oqMin, f.oqMax)) return false;
+    return true;
+  }
+
+  function listParent(products) {
+    const first = products.values().next().value;
+    return first && first.row ? first.row.parentNode : null;
+  }
+
+  function footerRow(parent, products) {
+    if (!parent) return null;
+    const ids = {};
+    products.forEach(function (p) { ids[p.id] = true; });
+    const rows = parent.children;
+    let seenProduct = false;
+    for (let i = 0; i < rows.length; i++) {
+      const tr = rows[i];
+      const pid = tr.getAttribute && tr.getAttribute('data-sc-pid');
+      if (pid && ids[pid]) {
+        seenProduct = true;
+        continue;
+      }
+      if (seenProduct) return tr;
+    }
+    return null;
+  }
+
+  function flowPageList(products, root) {
+    const parent = listParent(products);
+    if (!parent) return;
+    const key = (root.querySelector('#sc-ost-sort') || {}).value || settings.sortKey;
+    const dir = ((root.querySelector('#sc-ost-dir') || {}).value || settings.sortDir) === 'desc' ? -1 : 1;
+
+    const items = [];
+    products.forEach(function (p) { items.push(p); });
+    items.sort(function (a, b) {
+      let cmp = 0;
+      if (key === 'original') cmp = a.origIndex - b.origIndex;
+      else if (key === 'name') cmp = a.name.localeCompare(b.name);
+      else if (key === 'category') cmp = a.category.localeCompare(b.category) || a.name.localeCompare(b.name);
+      else if (key === 'use') cmp = a.monthlyUse - b.monthlyUse;
+      else if (key === 'stock') cmp = a.stock - b.stock;
+      else if (key === 'quality') cmp = currentQuality(a) - currentQuality(b);
+      else if (key === 'lw') cmp = num(a.t && a.t.value) - num(b.t && b.t.value);
+      else if (key === 'oq') cmp = num(a.q && a.q.value) - num(b.q && b.q.value);
+      else cmp = a.origIndex - b.origIndex;
+      if (key === 'original') return cmp;
+      return cmp * dir || (a.origIndex - b.origIndex);
+    });
+
+    const footer = footerRow(parent, products);
+    items.forEach(function (p) {
+      const show = matchesSortView(p, root);
+      p.row.classList.toggle('sc-ost-sorted-hide', !show);
+      if (footer) parent.insertBefore(p.row, footer);
+      else parent.appendChild(p.row);
+    });
+  }
+
+  function buildPanel(form, products) {
+    if (document.getElementById('sc-ost-root')) return;
+
+    const cats = [];
+    const seen = {};
+    products.forEach(function (p) {
+      if (!seen[p.category]) {
+        seen[p.category] = 0;
+        cats.push(p.category);
+      }
+      seen[p.category] += 1;
+    });
+    cats.sort();
+
+    const root = document.createElement('div');
+    root.id = 'sc-ost-root';
+    if (!settings.panelOpen) root.classList.add('sc-ost-collapsed');
+
+    function opt(val, label, cur) {
+      return '<option value="' + val + '"' + (cur === val ? ' selected' : '') + '>' + label + '</option>';
+    }
+
+    root.innerHTML =
+      '<div class="sc-ost-head" id="sc-ost-drag">' +
+        '<h3>Order Toolbox</h3>' +
+        '<button type="button" id="sc-ost-toggle">' + (settings.panelOpen ? '–' : '+') + '</button>' +
+      '</div>' +
+      '<div class="sc-ost-body">' +
+        '<div class="sc-ost-help">Check the box left of the icon to select or deselect a product. Sort only reorders the page list.</div>' +
+
+        '<div class="sc-ost-section">' +
+          '<h4>Sort list</h4>' +
+          '<div class="sc-ost-row">' +
+            '<select id="sc-ost-sort">' +
+              opt('original', 'Original order', settings.sortKey) +
+              opt('name', 'Name', settings.sortKey) +
+              opt('category', 'Category', settings.sortKey) +
+              opt('use', 'Monthly use', settings.sortKey) +
+              opt('stock', 'Stock', settings.sortKey) +
+              opt('quality', 'Quality', settings.sortKey) +
+              opt('lw', 'Low-water', settings.sortKey) +
+              opt('oq', 'Order qty', settings.sortKey) +
+            '</select>' +
+            '<select id="sc-ost-dir">' +
+              opt('asc', 'Asc', settings.sortDir) +
+              opt('desc', 'Desc', settings.sortDir) +
+            '</select>' +
+          '</div>' +
+          '<input type="text" id="sc-ost-search" placeholder="Filter list by name…" autocomplete="off">' +
+          '<div class="sc-ost-help">Field filters use the values already in the row.</div>' +
+          '<div class="sc-ost-row">' +
+            '<label>Q <input type="number" class="sc-ost-mini" id="sc-ost-fqmin" min="120" max="330" placeholder="min" value="' + settings.filterQMin + '"></label>' +
+            '<label>– <input type="number" class="sc-ost-mini" id="sc-ost-fqmax" min="120" max="330" placeholder="max" value="' + settings.filterQMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-ost-row">' +
+            '<label>LW <input type="number" class="sc-ost-mini" id="sc-ost-flwmin" min="0" placeholder="min" value="' + settings.filterLwMin + '"></label>' +
+            '<label>– <input type="number" class="sc-ost-mini" id="sc-ost-flwmax" min="0" placeholder="max" value="' + settings.filterLwMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-ost-row">' +
+            '<label>Ord <input type="number" class="sc-ost-mini" id="sc-ost-foqmin" min="0" placeholder="min" value="' + settings.filterOqMin + '"></label>' +
+            '<label>– <input type="number" class="sc-ost-mini" id="sc-ost-foqmax" min="0" placeholder="max" value="' + settings.filterOqMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-ost-row">' +
+            '<label>OS' +
+              '<select id="sc-ost-fos">' +
+                opt('any', 'Any strategy', settings.filterOs) +
+                opt('0', 'Off', settings.filterOs) +
+                opt('1', 'Months', settings.filterOs) +
+                opt('2', 'Units', settings.filterOs) +
+              '</select>' +
+            '</label>' +
+          '</div>' +
+          '<div class="sc-ost-chips" id="sc-ost-cats">' +
+            cats.map(function (c) {
+              const meta = CATEGORY_META[c] || { label: c };
+              return '<button type="button" class="sc-ost-chip" data-cat="' + c + '" data-on="0">' +
+                meta.label + ' ' + seen[c] + '</button>';
+            }).join('') +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-ost-section">' +
+          '<h4>Selection</h4>' +
+          '<div class="sc-ost-actions">' +
+            '<button type="button" class="sc-btn" data-sel="all">Check visible</button>' +
+            '<button type="button" class="sc-btn alt" data-sel="none">Uncheck all</button>' +
+            '<button type="button" class="sc-btn alt" data-sel="invert">Invert visible</button>' +
+            '<button type="button" class="sc-btn" data-sel="used">Check used</button>' +
+            '<button type="button" class="sc-btn" data-sel="military">Check military</button>' +
+            '<button type="button" class="sc-btn" data-sel="civilian">Check civilian</button>' +
+            '<button type="button" class="sc-btn" data-sel="industry">Check industry</button>' +
+          '</div>' +
+          '<div class="sc-ost-status" id="sc-ost-count"></div>' +
+        '</div>' +
+
+        '<div class="sc-ost-section">' +
+          '<h4>Timeframe / quantity</h4>' +
+          '<div class="sc-ost-row">' +
+            '<label>Low-water <input type="number" id="sc-ost-lw" min="0" max="120" value="' + settings.lowWater + '"></label>' +
+            '<label>Order <input type="number" id="sc-ost-oq" min="0" max="240" value="' + settings.orderMonths + '"></label>' +
+          '</div>' +
+          '<div class="sc-ost-row">' +
+            '<label>Mode' +
+              '<select id="sc-ost-osmode">' +
+                opt('auto', 'Auto (months/units)', settings.osMode) +
+                opt('1', 'Months', settings.osMode) +
+                opt('2', 'Units', settings.osMode) +
+                opt('0', 'Off', settings.osMode) +
+              '</select>' +
+            '</label>' +
+          '</div>' +
+          '<div class="sc-ost-actions">' +
+            '<button type="button" class="sc-btn ok" data-act="set-order">Apply order</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-ost-section">' +
+          '<h4>Quality (120–330)</h4>' +
+          '<div class="sc-ost-row">' +
+            '<label>Set <input type="number" id="sc-ost-qv" min="120" max="330" value="' + settings.quality + '"></label>' +
+            '<label>Offset <input type="number" id="sc-ost-dq" value="' + settings.offsetQ + '"></label>' +
+          '</div>' +
+          '<div class="sc-ost-actions">' +
+            '<button type="button" class="sc-btn ok" data-act="set-q">Set quality</button>' +
+            '<button type="button" class="sc-btn" data-act="add-q">+ offset</button>' +
+            '<button type="button" class="sc-btn" data-act="sub-q">− offset</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-ost-section">' +
+          '<h4>Presets</h4>' +
+          '<div class="sc-ost-actions">' +
+            '<button type="button" class="sc-btn" data-act="preset-economy">Economy 3/14 @120</button>' +
+            '<button type="button" class="sc-btn" data-act="preset-deep">Stockpile 8/24 @160</button>' +
+            '<button type="button" class="sc-btn" data-act="preset-mil">Military 6/18 @cap</button>' +
+            '<button type="button" class="sc-btn" data-act="preset-civ">Civilian 3/14 @120</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-ost-section">' +
+          '<h4>Named revisions</h4>' +
+          '<div class="sc-ost-help">Saves current field values. Restore skips products that no longer exist and leaves new products unchanged.</div>' +
+          '<input type="text" id="sc-ost-revname" placeholder="Revision name…" autocomplete="off">' +
+          '<div class="sc-ost-actions">' +
+            '<button type="button" class="sc-btn ok" data-rev="save">Save revision</button>' +
+            '<button type="button" class="sc-btn" data-rev="save-checked">Save checked</button>' +
+          '</div>' +
+          '<select id="sc-ost-revlist"></select>' +
+          '<div class="sc-ost-actions">' +
+            '<button type="button" class="sc-btn ok" data-rev="restore">Restore</button>' +
+            '<button type="button" class="sc-btn alt" data-rev="rename">Rename</button>' +
+            '<button type="button" class="sc-btn alt" data-rev="delete">Delete</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-ost-status" id="sc-ost-msg">Ready. Save with the site button after applying.</div>' +
+      '</div>';
+
+    document.body.appendChild(root);
+    fillRevisionSelect(root);
+    wirePanel(root, form, products);
+    makeDraggable(root, root.querySelector('#sc-ost-drag'));
+    flowPageList(products, root);
+    refreshCount(products);
+  }
+
+  function refreshCount(products) {
+    const root = document.getElementById('sc-ost-root');
+    if (!root) return;
+    const el = root.querySelector('#sc-ost-count');
+    let vis = 0;
+    products.forEach(function (p) {
+      if (matchesSortView(p, root)) vis += 1;
+    });
+    if (el) el.textContent = selectedList(products).length + ' checked · ' + vis + ' listed · ' + products.size + ' total';
+  }
+
+  function persist(root) {
+    settings.lowWater = num(root.querySelector('#sc-ost-lw').value);
+    settings.orderMonths = num(root.querySelector('#sc-ost-oq').value);
+    settings.quality = clampQ(root.querySelector('#sc-ost-qv').value);
+    settings.offsetQ = num(root.querySelector('#sc-ost-dq').value);
+    settings.osMode = root.querySelector('#sc-ost-osmode').value;
+    settings.sortKey = root.querySelector('#sc-ost-sort').value;
+    settings.sortDir = root.querySelector('#sc-ost-dir').value;
+    settings.filterQMin = root.querySelector('#sc-ost-fqmin').value;
+    settings.filterQMax = root.querySelector('#sc-ost-fqmax').value;
+    settings.filterLwMin = root.querySelector('#sc-ost-flwmin').value;
+    settings.filterLwMax = root.querySelector('#sc-ost-flwmax').value;
+    settings.filterOqMin = root.querySelector('#sc-ost-foqmin').value;
+    settings.filterOqMax = root.querySelector('#sc-ost-foqmax').value;
+    settings.filterOs = root.querySelector('#sc-ost-fos').value;
+    root.querySelector('#sc-ost-qv').value = String(settings.quality);
+    saveSettings();
+  }
+
+  function fillRevisionSelect(root, keepId) {
+    const sel = root.querySelector('#sc-ost-revlist');
+    if (!sel) return;
+    const pack = loadRevisions();
+    const items = pack.items.slice().sort(function (a, b) {
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+    const current = keepId || sel.value;
+    sel.innerHTML = '';
+    if (!items.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '(no revisions saved)';
+      sel.appendChild(o);
+      return;
+    }
+    items.forEach(function (rev) {
+      const o = document.createElement('option');
+      o.value = rev.id;
+      const n = (rev.products && rev.products.length) || 0;
+      const when = rev.savedAt ? String(rev.savedAt).replace('T', ' ').slice(0, 16) : '';
+      o.textContent = rev.name + ' · ' + n + ' items' + (when ? ' · ' + when : '');
+      sel.appendChild(o);
+    });
+    if (current && sel.querySelector('option[value="' + current + '"]')) sel.value = current;
+  }
+
+  function newRevisionId() {
+    return 'rev-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function selectedRevision(root) {
+    const id = (root.querySelector('#sc-ost-revlist') || {}).value;
+    if (!id) return null;
+    const pack = loadRevisions();
+    for (let i = 0; i < pack.items.length; i++) {
+      if (pack.items[i].id === id) return pack.items[i];
+    }
+    return null;
+  }
+
+  function say(text) {
+    const el = document.querySelector('#sc-ost-msg');
+    if (el) el.textContent = text;
+  }
+
+  function confirmApply(summary, count) {
+    return window.confirm(
+      summary + '\n\n' +
+      count + ' checked product' + (count === 1 ? '' : 's') + ' will be updated in the form.\n' +
+      'Nothing is saved until you click the site button\n' +
+      '"Save Order Quantities and Quality".\n\nContinue?'
+    );
+  }
+
+  function wirePanel(root, form, products) {
+    root.querySelector('#sc-ost-toggle').addEventListener('click', function () {
+      settings.panelOpen = !settings.panelOpen;
+      root.classList.toggle('sc-ost-collapsed', !settings.panelOpen);
+      root.querySelector('#sc-ost-toggle').textContent = settings.panelOpen ? '–' : '+';
+      saveSettings();
+    });
+
+    function relist() {
+      persist(root);
+      flowPageList(products, root);
+      refreshCount(products);
+    }
+
+    root.querySelector('#sc-ost-search').addEventListener('input', relist);
+    root.querySelector('#sc-ost-sort').addEventListener('change', relist);
+    root.querySelector('#sc-ost-dir').addEventListener('change', relist);
+    ['#sc-ost-fqmin', '#sc-ost-fqmax', '#sc-ost-flwmin', '#sc-ost-flwmax', '#sc-ost-foqmin', '#sc-ost-foqmax', '#sc-ost-fos'].forEach(function (sid) {
+      const el = root.querySelector(sid);
+      if (!el) return;
+      el.addEventListener('input', relist);
+      el.addEventListener('change', relist);
+    });
+
+    root.querySelector('#sc-ost-cats').addEventListener('click', function (ev) {
+      const chip = ev.target.closest('.sc-ost-chip');
+      if (!chip) return;
+      chip.dataset.on = chip.dataset.on === '1' ? '0' : '1';
+      flowPageList(products, root);
+      refreshCount(products);
+    });
+
+    form.addEventListener('change', function (ev) {
+      if (ev.target && ev.target.classList && ev.target.classList.contains('sc-ost-pick')) {
+        const row = ev.target.closest('tr');
+        if (row) row.classList.toggle('sc-ost-selected', ev.target.checked);
+        refreshCount(products);
+      }
+    });
+
+    root.addEventListener('change', function (ev) {
+      if (ev.target && (ev.target.id === 'sc-ost-sort' || ev.target.id === 'sc-ost-dir' || ev.target.id === 'sc-ost-search')) return;
+      persist(root);
+    });
+
+    root.addEventListener('click', function (ev) {
+      const selBtn = ev.target.closest('[data-sel]');
+      if (selBtn) {
+        runSelection(selBtn.getAttribute('data-sel'), products, root);
+        syncSelectedClass(products);
+        refreshCount(products);
+        return;
+      }
+      const revBtn = ev.target.closest('[data-rev]');
+      if (revBtn) {
+        persist(root);
+        runRevision(revBtn.getAttribute('data-rev'), form, products, root);
+        flowPageList(products, root);
+        refreshCount(products);
+        return;
+      }
+      const actBtn = ev.target.closest('[data-act]');
+      if (actBtn) {
+        persist(root);
+        runAction(actBtn.getAttribute('data-act'), form, products, root);
+        flowPageList(products, root);
+        refreshCount(products);
+      }
+    });
+  }
+
+  function runSelection(kind, products, root) {
+    products.forEach(function (p) {
+      const listed = matchesSortView(p, root);
+      let on = isSelected(p);
+      if (kind === 'all') on = listed;
+      else if (kind === 'none') on = false;
+      else if (kind === 'invert') on = listed ? !on : on;
+      else if (kind === 'used') on = listed && p.monthlyUse > 0;
+      else if (kind === 'military') on = listed && p.group === 'military';
+      else if (kind === 'civilian') on = listed && p.group === 'civilian';
+      else if (kind === 'industry') on = listed && p.group === 'industry';
+      setSelected(p, on);
+    });
+  }
+
+  function runAction(act, form, products, root) {
+    const list = selectedList(products);
+    if (!list.length) {
+      say('Check one or more products first (box left of the icon).');
+      return;
+    }
+
+    const osMode = root.querySelector('#sc-ost-osmode').value;
+    const lw = num(root.querySelector('#sc-ost-lw').value);
+    const oq = num(root.querySelector('#sc-ost-oq').value);
+    const qv = clampQ(root.querySelector('#sc-ost-qv').value);
+    const off = num(root.querySelector('#sc-ost-dq').value);
+
+    let summary = '';
+    if (act === 'set-order') {
+      summary = osMode === '0'
+        ? 'Turn OFF order strategies.'
+        : 'Set low-water to ' + lw + ' and order quantity to ' + oq + ' (mode: ' + osMode + ').';
+    } else if (act === 'set-q') {
+      summary = 'Set requested quality to ' + qv + ' (clamped 120–330).';
+    } else if (act === 'add-q') {
+      summary = 'Add quality offset +' + off + ' (clamped 120–330).';
+    } else if (act === 'sub-q') {
+      summary = 'Subtract quality offset −' + off + ' (clamped 120–330).';
+    } else if (act === 'preset-economy') {
+      summary = 'Economy: used products 3 / 14 @ quality 120; unused off.';
+    } else if (act === 'preset-deep') {
+      summary = 'Stockpile: 8 / 24 @ quality 160.';
+    } else if (act === 'preset-mil') {
+      summary = 'Checked military rows: 6 / 18 @ quality 330.';
+    } else if (act === 'preset-civ') {
+      summary = 'Checked civilian + industry: 3 / 14 @ quality 120.';
+    } else {
+      summary = 'Apply ' + act + '.';
+    }
+
+    if (!confirmApply(summary, list.length)) {
+      say('Cancelled.');
+      return;
+    }
+
+    let changed = 0;
+    list.forEach(function (p) {
+      if (act === 'set-order') {
+        applyOrder(form, p, osMode, lw, oq);
+        changed += 1;
+      } else if (act === 'set-q') {
+        applyQuality(form, p, qv, true);
+        changed += 1;
+      } else if (act === 'add-q') {
+        applyQuality(form, p, currentQuality(p) + off, true);
+        changed += 1;
+      } else if (act === 'sub-q') {
+        applyQuality(form, p, currentQuality(p) - off, true);
+        changed += 1;
+      } else if (act === 'preset-economy') {
+        if (p.monthlyUse > 0) {
+          applyOrder(form, p, 'auto', 3, 14);
+          applyQuality(form, p, 120, true);
+        } else {
+          applyOrder(form, p, '0', 0, 0);
+        }
+        changed += 1;
+      } else if (act === 'preset-deep') {
+        applyOrder(form, p, 'auto', 8, 24);
+        applyQuality(form, p, 160, true);
+        changed += 1;
+      } else if (act === 'preset-mil') {
+        if (p.group === 'military') {
+          applyOrder(form, p, 'auto', 6, 18);
+          applyQuality(form, p, Q_MAX, true);
+          changed += 1;
+        }
+      } else if (act === 'preset-civ') {
+        if (p.group === 'civilian' || p.group === 'industry') {
+          applyOrder(form, p, 'auto', 3, 14);
+          applyQuality(form, p, 120, true);
+          changed += 1;
+        }
+      }
+    });
+
+    say('Updated ' + changed + ' checked row' + (changed === 1 ? '' : 's') + '. Review the list, then use the site Save button.');
+  }
+
+  function runRevision(kind, form, products, root) {
+    const pack = loadRevisions();
+    const nameBox = root.querySelector('#sc-ost-revname');
+
+    if (kind === 'save' || kind === 'save-checked') {
+      const name = String(nameBox && nameBox.value || '').replace(/\s+/g, ' ').trim();
+      if (!name) {
+        say('Enter a revision name first.');
+        return;
+      }
+      const source = kind === 'save-checked' ? selectedList(products) : [];
+      if (kind === 'save-checked' && !source.length) {
+        say('Check products to include, or use Save revision for every row.');
+        return;
+      }
+      const snaps = [];
+      const walk = kind === 'save-checked' ? source : [];
+      if (kind === 'save') {
+        products.forEach(function (p) { walk.push(p); });
+      }
+      walk.forEach(function (p) { snaps.push(snapshotProduct(form, p)); });
+      const existing = pack.items.filter(function (r) { return normName(r.name) === normName(name); })[0];
+      if (existing) {
+        if (!window.confirm('A revision named "' + existing.name + '" already exists. Overwrite it?')) {
+          say('Save cancelled.');
+          return;
+        }
+        existing.savedAt = new Date().toISOString();
+        existing.products = snaps;
+        existing.format = REVISION_FORMAT;
+        existing.scope = kind === 'save-checked' ? 'checked' : 'all';
+      } else {
+        pack.items.push({
+          id: newRevisionId(),
+          format: REVISION_FORMAT,
+          name: name,
+          savedAt: new Date().toISOString(),
+          scope: kind === 'save-checked' ? 'checked' : 'all',
+          products: snaps
+        });
+      }
+      storeRevisions(pack);
+      fillRevisionSelect(root, existing ? existing.id : pack.items[pack.items.length - 1].id);
+      say('Saved "' + name + '" (' + snaps.length + ' products). New items added later stay unchanged on restore.');
+      return;
+    }
+
+    const rev = selectedRevision(root);
+    if (!rev) {
+      say('Pick a saved revision first.');
+      return;
+    }
+
+    if (kind === 'delete') {
+      if (!window.confirm('Delete revision "' + rev.name + '"?')) return;
+      pack.items = pack.items.filter(function (r) { return r.id !== rev.id; });
+      storeRevisions(pack);
+      fillRevisionSelect(root);
+      say('Deleted "' + rev.name + '".');
+      return;
+    }
+
+    if (kind === 'rename') {
+      const name = String(nameBox && nameBox.value || '').replace(/\s+/g, ' ').trim();
+      if (!name) {
+        say('Type the new name in the revision name box.');
+        return;
+      }
+      rev.name = name;
+      storeRevisions(pack);
+      fillRevisionSelect(root, rev.id);
+      say('Renamed revision to "' + name + '".');
+      return;
+    }
+
+    if (kind === 'restore') {
+      const snaps = Array.isArray(rev.products) ? rev.products : [];
+      const indexes = buildIndexes(products);
+      const matched = [];
+      let missing = 0;
+      snaps.forEach(function (snap) {
+        const p = matchSnapshot(snap, indexes);
+        if (p) matched.push({ p: p, snap: snap });
+        else missing += 1;
+      });
+      let unmatchedNew = 0;
+      const used = {};
+      matched.forEach(function (m) { used[m.p.id] = true; });
+      products.forEach(function (p) {
+        if (!used[p.id]) unmatchedNew += 1;
+      });
+      const msg =
+        'Restore "' + rev.name + '"?\n\n' +
+        matched.length + ' current products will be updated.\n' +
+        missing + ' saved items are gone and will be skipped.\n' +
+        unmatchedNew + ' newer page products have no snapshot and will be left as they are.\n\n' +
+        'This only fills the form. Save with the site button when ready.';
+      if (!window.confirm(msg)) {
+        say('Restore cancelled.');
+        return;
+      }
+      matched.forEach(function (m) {
+        const snap = m.snap;
+        const os = snap.os == null ? 'auto' : String(snap.os);
+        applyOrder(form, m.p, os, snap.lowWater, snap.orderQty);
+        const request = snap.requestQuality !== false && String(snap.qs) !== '1';
+        if (request) applyQuality(form, m.p, snap.quality == null ? Q_MIN : snap.quality, true);
+        else applyQuality(form, m.p, snap.quality == null ? Q_MIN : snap.quality, false);
+      });
+      say('Restored "' + rev.name + '": ' + matched.length + ' updated, ' + missing + ' skipped, ' + unmatchedNew + ' new items untouched.');
+    }
+  }
+
+  function makeDraggable(box, handle) {
+    let drag = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    handle.addEventListener('mousedown', function (ev) {
+      if (ev.target.closest('button')) return;
+      drag = true;
+      sx = ev.clientX;
+      sy = ev.clientY;
+      const rect = box.getBoundingClientRect();
+      ox = rect.left;
+      oy = rect.top;
+      ev.preventDefault();
+    });
+    window.addEventListener('mousemove', function (ev) {
+      if (!drag) return;
+      box.style.left = Math.max(0, ox + ev.clientX - sx) + 'px';
+      box.style.top = Math.max(0, oy + ev.clientY - sy) + 'px';
+      box.style.right = 'auto';
+    });
+    window.addEventListener('mouseup', function () { drag = false; });
+  }
+
+  function init() {
+    if (!pageMatches()) return;
+    if (document.documentElement.getAttribute(INIT_FLAG) === '1' && document.getElementById('sc-ost-root')) return;
+    const form = findForm();
+    if (!form) return;
+    const products = collectProducts(form);
+    if (!products.size) return;
+    document.documentElement.setAttribute(INIT_FLAG, '1');
+    installPickboxes(products);
+    buildPanel(form, products);
+  }
+
+  function start() {
+    init();
+    const obs = new MutationObserver(function () {
+      if (pageMatches() && !document.getElementById('sc-ost-root')) {
+        document.documentElement.removeAttribute(INIT_FLAG);
+        init();
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+})();
