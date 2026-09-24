@@ -1,0 +1,1010 @@
+// ==UserScript==
+// @name         Simcountry State Salary Toolbox
+// @namespace    https://simcountry.com/userscripts/state-salaries
+// @version      1.0.0
+// @description  Select, sort, and filter state corporation salaries; bulk-set target or increase; save named revisions.
+// @author       TheWalkingGlitch
+// @match        https://*.simcountry.com/cgi-bin/*
+// @match        http://*.simcountry.com/cgi-bin/*
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
+// @run-at       document-end
+// ==/UserScript==
+
+/*
+  INSTALL: Tampermonkey → New script → paste → save.
+  Open Country → Corporations → Salary Levels
+  (URL contains statecmpsalaries).
+
+  Selection = checkbox left of the product icon.
+  Sort/filter only reflows the live #corplist rows.
+  Apply fills miSalaStrat / miSala / miSalaTarget. Save with
+  the site button "Set Salary Changes".
+
+  Revisions: scOstSalaryRevisions.v1 — keyed by corp id, with
+  name + product fallback so new corps/industries are left alone.
+*/
+
+(function () {
+  'use strict';
+
+  const SETTINGS_KEY = 'scSalToolbox.v1';
+  const REVISIONS_KEY = 'scOstSalaryRevisions.v1';
+  const REVISION_FORMAT = 1;
+  const INIT_FLAG = 'scSalToolboxInit';
+
+  const ICON_GROUP = {
+    offensive: 'military',
+    defensive: 'military',
+    strategic: 'military',
+    industry: 'industry',
+    mining: 'industry',
+    hightech: 'industry',
+    construction: 'industry',
+    spaceindustry: 'industry',
+    food: 'civilian',
+    agriculture: 'civilian',
+    recreation: 'civilian',
+    services: 'civilian',
+    utilities: 'civilian',
+    government: 'civilian'
+  };
+
+  const DEFAULTS = {
+    panelOpen: true,
+    target: 300,
+    increase: 0,
+    mode: '1',
+    sortKey: 'original',
+    sortDir: 'asc',
+    filterCurMin: '',
+    filterCurMax: '',
+    filterTgtMin: '',
+    filterTgtMax: '',
+    filterWelMin: '',
+    filterWelMax: '',
+    filterHireMin: '',
+    filterHireMax: '',
+    filterMode: 'any'
+  };
+
+  function pageWin() {
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow.document) return unsafeWindow;
+    } catch (e) { /* isolated */ }
+    return window;
+  }
+
+  function gmGet(key, fallback) {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(key, fallback);
+    } catch (e) { /* ignore */ }
+    try {
+      const raw = localStorage.getItem(key);
+      return raw == null ? fallback : JSON.parse(raw);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function gmSet(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(key, value);
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+  }
+
+  const settings = Object.assign({}, DEFAULTS, gmGet(SETTINGS_KEY, null) || {});
+
+  function saveSettings() {
+    gmSet(SETTINGS_KEY, settings);
+  }
+
+  function addStyle(css) {
+    if (typeof GM_addStyle === 'function') GM_addStyle(css);
+    else {
+      const el = document.createElement('style');
+      el.textContent = css;
+      document.documentElement.appendChild(el);
+    }
+  }
+
+  addStyle(`
+    #sc-sal-root {
+      position: fixed; top: 64px; right: 8px; z-index: 2147483000;
+      width: 256px; max-height: calc(100vh - 76px); overflow: auto;
+      font: 11px/1.3 Arial, Helvetica, sans-serif; color: #111;
+      background: #f3f6ff; border: 1px solid #2a3a7a;
+      box-shadow: 0 6px 18px rgba(0,0,0,.25); border-radius: 4px;
+    }
+    #sc-sal-root.sc-sal-collapsed { width: auto; max-height: none; overflow: visible; }
+    #sc-sal-root.sc-sal-collapsed .sc-sal-body { display: none; }
+    #sc-sal-root * { box-sizing: border-box; }
+    #sc-sal-root h3, #sc-sal-root h4 { margin: 0; }
+    .sc-sal-head {
+      display: flex; align-items: center; justify-content: space-between;
+      background: #1d4f9c; color: #fff; padding: 4px 6px; cursor: move; user-select: none;
+    }
+    .sc-sal-head h3 { font-size: 11px; font-weight: 700; }
+    .sc-sal-head button {
+      background: #0f2f66; color: #fff; border: 1px solid #9bb6e6;
+      border-radius: 2px; cursor: pointer; padding: 0 5px; font-size: 12px;
+    }
+    .sc-sal-body { padding: 6px 7px 8px; }
+    .sc-sal-help { color: #445; font-size: 10px; margin: 0 0 5px; }
+    .sc-sal-row { display: flex; gap: 4px; align-items: center; margin: 3px 0; flex-wrap: wrap; }
+    .sc-sal-row label { display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+    #sc-sal-root input[type="number"],
+    #sc-sal-root input[type="text"],
+    #sc-sal-root select {
+      font-size: 11px; padding: 1px 3px; border: 1px solid #7a88b0; border-radius: 2px;
+    }
+    #sc-sal-root input[type="number"] { width: 52px; }
+    #sc-sal-root input.sc-sal-mini { width: 40px; }
+    #sc-sal-root select { max-width: 160px; }
+    #sc-sal-root select#sc-sal-revlist { width: 100%; max-width: none; }
+    #sc-sal-root input[type="text"]#sc-sal-search,
+    #sc-sal-root input[type="text"]#sc-sal-revname { width: 100%; }
+    .sc-sal-chips { display: flex; flex-wrap: wrap; gap: 3px; margin: 4px 0; }
+    .sc-sal-chip {
+      border: 1px solid #4b5d99; background: #fff; color: #1a2a55;
+      border-radius: 999px; padding: 0 6px; cursor: pointer; font-size: 10px; line-height: 16px;
+    }
+    .sc-sal-chip[data-on="1"] { background: #1d4f9c; color: #fff; }
+    .sc-sal-actions { display: flex; flex-wrap: wrap; gap: 3px; margin: 4px 0; }
+    #sc-sal-root button.sc-btn {
+      background: #2d6bcd; color: #fff; border: 0; border-radius: 2px;
+      padding: 3px 6px; cursor: pointer; font-size: 10px;
+    }
+    #sc-sal-root button.sc-btn:hover { background: #1d4f9c; }
+    #sc-sal-root button.sc-btn.alt { background: #4b5d99; }
+    #sc-sal-root button.sc-btn.ok { background: #2a7a3a; }
+    .sc-sal-section { border-top: 1px solid #c5cbe0; margin-top: 6px; padding-top: 5px; }
+    .sc-sal-section h4 { font-size: 11px; color: #1d4f9c; margin-bottom: 3px; }
+    .sc-sal-status { background: #e7edff; border: 1px dashed #7a88b0; padding: 3px 5px; margin-top: 5px; }
+
+    form td.sc-sal-iconcell { white-space: nowrap !important; vertical-align: middle; }
+    form input.sc-sal-pick {
+      width: 13px; height: 13px; margin: 0 4px 0 0; padding: 0; vertical-align: middle;
+    }
+    form td.sc-sal-iconcell img { vertical-align: middle; display: inline; }
+    form tr.sc-sal-selected > td { background-color: #d4e4ff !important; }
+    form tr.sc-sal-hide { display: none !important; }
+  `);
+
+  function pageMatches() {
+    const form = findForm();
+    if (!form) return false;
+    return !!form.querySelector('input[name^="miSalaStrat"]');
+  }
+
+  function findForm() {
+    const forms = document.querySelectorAll('form');
+    for (let i = 0; i < forms.length; i++) {
+      const m = forms[i].querySelector('input[name="SN_METHOD"]');
+      if (m && /stateCmpSalariesSubmit/i.test(m.value)) return forms[i];
+    }
+    const named = document.querySelector('#corplist form') || document.querySelector('form input[name^="miSalaStrat"]');
+    return named ? named.closest('form') : null;
+  }
+
+  function num(text) {
+    const v = parseFloat(String(text == null ? '' : text).replace(/,/g, '').replace(/[^\d.-]/g, ''));
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function emptyToNull(v) {
+    const s = String(v == null ? '' : v).trim();
+    if (s === '') return null;
+    const n = num(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function inRange(value, minV, maxV) {
+    if (minV != null && value < minV) return false;
+    if (maxV != null && value > maxV) return false;
+    return true;
+  }
+
+  function normName(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function corpIdFromName(name) {
+    const m = String(name || '').match(/^(?:miSalaStrat|miSalaTarget|miSala)(\d+)$/);
+    return m ? m[1] : null;
+  }
+
+  function iconKey(src) {
+    const m = String(src || '').match(/\/([a-z]+)16\.(?:gif|png)/i);
+    return m ? m[1].toLowerCase() : 'other';
+  }
+
+  function salaryStrat(id) {
+    const w = pageWin();
+    try {
+      if (w.SalaryStrats && w.SalaryStrats['' + id]) return w.SalaryStrats['' + id];
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function collectCorps(form) {
+    const map = new Map();
+    let index = 0;
+    let section = 'State Corporations';
+    const table = form.querySelector('table.data') || form.querySelector('table');
+    if (!table) return map;
+    map._table = table;
+    map._origRows = Array.prototype.slice.call(table.rows || table.querySelectorAll('tr'));
+    Array.prototype.forEach.call(table.querySelectorAll('tr'), function (tr) {
+      const header = tr.querySelector('th, .entlistheader, a.tip');
+      const strat = tr.querySelector('input[name^="miSalaStrat"]');
+      if (!strat) {
+        const label = (tr.textContent || '').replace(/\s+/g, ' ').trim();
+        if (/State Corporations/i.test(label)) section = 'State Corporations';
+        else if (/National Industries/i.test(label)) section = 'National Industries';
+        else if (/Country Controlled|Public Corporations/i.test(label)) section = 'Public Corporations';
+        tr.setAttribute('data-sc-sal-chrome', '1');
+        return;
+      }
+      const id = corpIdFromName(strat.name);
+      if (!id) return;
+      const typeLink = tr.querySelector('a.popup.gadgetlink[title], a[onclick*="productinfo"]');
+      const nameLink = tr.querySelector('a.gadgetlink[href*="miCorpNumber"], a[title*="Corporation page"]');
+      const icon = tr.querySelector('img[src*="16."]');
+      const tds = tr.querySelectorAll('td.data');
+      const welfare = tds[3] ? num(tds[3].textContent) : 0;
+      const hiring = tds[4] ? num(tds[4].textContent) : 0;
+      const current = tds[6] ? num(tds[6].textContent) : 0;
+      const product = typeLink ? (typeLink.getAttribute('title') || typeLink.textContent || '').trim() : '';
+      const ikey = iconKey(icon ? icon.getAttribute('src') : '');
+      map.set(id, {
+        id: id,
+        origIndex: index++,
+        row: tr,
+        section: section,
+        name: nameLink ? nameLink.textContent.replace(/\s+/g, ' ').trim() : ('Corp ' + id),
+        product: product,
+        iconKey: ikey,
+        group: ICON_GROUP[ikey] || 'other',
+        welfare: welfare,
+        hiring: hiring,
+        current: current,
+        strat0: form.querySelector('input[name="miSalaStrat' + id + '"][value="0"]'),
+        strat1: form.querySelector('input[name="miSalaStrat' + id + '"][value="1"]'),
+        change: form.querySelector('input[name="miSala' + id + '"]'),
+        target: form.querySelector('input[name="miSalaTarget' + id + '"]'),
+        pick: null
+      });
+      tr.setAttribute('data-sc-sal-id', id);
+    });
+    return map;
+  }
+
+  function installPickboxes(corps) {
+    corps.forEach(function (c) {
+      if (c.row.querySelector('input.sc-sal-pick')) {
+        c.pick = c.row.querySelector('input.sc-sal-pick');
+        return;
+      }
+      const td = c.row.querySelector('td');
+      if (!td) return;
+      td.classList.add('sc-sal-iconcell');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.className = 'sc-sal-pick';
+      box.value = '1';
+      box.title = 'Select ' + c.name;
+      box.setAttribute('data-sc-sal-id', c.id);
+      td.insertBefore(box, td.firstChild);
+      c.pick = box;
+    });
+  }
+
+  function isSelected(c) {
+    return !!(c.pick && c.pick.checked);
+  }
+
+  function setSelected(c, on) {
+    if (c.pick) c.pick.checked = !!on;
+    if (c.row) c.row.classList.toggle('sc-sal-selected', !!on);
+  }
+
+  function selectedList(corps) {
+    const out = [];
+    corps.forEach(function (c) { if (isSelected(c)) out.push(c); });
+    return out;
+  }
+
+  function currentMode(c) {
+    if (c.strat1 && c.strat1.checked) return '1';
+    if (c.strat0 && c.strat0.checked) return '0';
+    return '1';
+  }
+
+  function fieldTarget(c) {
+    return c.target ? num(c.target.value) : 0;
+  }
+
+  function fieldIncrease(c) {
+    return c.change ? num(c.change.value) : 0;
+  }
+
+  function enableField(el, on) {
+    if (!el) return;
+    el.disabled = !on;
+    if (on) el.removeAttribute('disabled');
+    else el.setAttribute('disabled', 'disabled');
+  }
+
+  function writeInput(el, value) {
+    if (!el) return;
+    enableField(el, true);
+    el.value = String(value);
+    try {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) { /* ignore */ }
+  }
+
+  function applySalary(c, mode, increase, target) {
+    const use = String(mode) === '0' ? '0' : '1';
+    if (use === '0' && c.strat0) c.strat0.checked = true;
+    if (use === '1' && c.strat1) c.strat1.checked = true;
+
+    const inc = Math.max(0, num(increase));
+    const tgt = Math.max(0, num(target));
+
+    const st = salaryStrat(c.id);
+    if (st) {
+      st.salaryStrategy = parseInt(use, 10);
+      st.salaryChange = inc;
+      st.salaryTarget = tgt;
+    }
+
+    if (use === '0') {
+      writeInput(c.change, inc);
+      if (c.target) {
+        c.target.value = '';
+        enableField(c.target, false);
+      }
+    } else {
+      writeInput(c.target, tgt);
+      if (c.change) {
+        c.change.value = '';
+        enableField(c.change, false);
+      }
+    }
+  }
+
+  function snapshotCorp(c) {
+    return {
+      id: String(c.id),
+      name: c.name,
+      nameKey: normName(c.name),
+      product: c.product,
+      productKey: normName(c.product),
+      section: c.section,
+      mode: currentMode(c),
+      increase: fieldIncrease(c),
+      target: fieldTarget(c),
+      current: c.current
+    };
+  }
+
+  function loadRevisions() {
+    const raw = gmGet(REVISIONS_KEY, null);
+    if (!raw || typeof raw !== 'object') return { format: REVISION_FORMAT, items: [] };
+    return { format: REVISION_FORMAT, items: Array.isArray(raw.items) ? raw.items : [] };
+  }
+
+  function storeRevisions(pack) {
+    gmSet(REVISIONS_KEY, { format: REVISION_FORMAT, items: pack.items || [] });
+  }
+
+  function buildIndexes(corps) {
+    const byId = new Map();
+    const byNameProd = new Map();
+    const byName = new Map();
+    corps.forEach(function (c) {
+      byId.set(String(c.id), c);
+      const nk = normName(c.name);
+      byNameProd.set(nk + '\t' + normName(c.product), c);
+      if (!byName.has(nk)) byName.set(nk, []);
+      byName.get(nk).push(c);
+    });
+    return { byId: byId, byNameProd: byNameProd, byName: byName };
+  }
+
+  function matchSnapshot(snap, indexes) {
+    if (!snap) return null;
+    if (snap.id != null && indexes.byId.has(String(snap.id))) return indexes.byId.get(String(snap.id));
+    const nk = snap.nameKey || normName(snap.name);
+    const pk = snap.productKey || normName(snap.product);
+    if (nk && pk && indexes.byNameProd.has(nk + '\t' + pk)) return indexes.byNameProd.get(nk + '\t' + pk);
+    if (nk && indexes.byName.has(nk)) {
+      const hits = indexes.byName.get(nk);
+      if (hits.length === 1) return hits[0];
+    }
+    return null;
+  }
+
+  function searchNeedle(root) {
+    return (root.querySelector('#sc-sal-search').value || '').trim().toLowerCase();
+  }
+
+  function activeChips(root, sel) {
+    const on = [];
+    root.querySelectorAll(sel + '[data-on="1"]').forEach(function (ch) {
+      on.push(ch.getAttribute('data-val'));
+    });
+    return on;
+  }
+
+  function matchesView(c, root) {
+    const q = searchNeedle(root);
+    if (q && (c.name + ' ' + c.product + ' ' + c.section + ' ' + c.id).toLowerCase().indexOf(q) === -1) return false;
+    const types = activeChips(root, '#sc-sal-types .sc-sal-chip');
+    if (types.length && types.indexOf(c.product) === -1) return false;
+    const secs = activeChips(root, '#sc-sal-secs .sc-sal-chip');
+    if (secs.length && secs.indexOf(c.section) === -1) return false;
+    const groups = activeChips(root, '#sc-sal-groups .sc-sal-chip');
+    if (groups.length && groups.indexOf(c.group) === -1) return false;
+    const modeF = (root.querySelector('#sc-sal-fmode') || {}).value || 'any';
+    if (modeF !== 'any' && currentMode(c) !== modeF) return false;
+    const curMin = emptyToNull(root.querySelector('#sc-sal-fcmin') && root.querySelector('#sc-sal-fcmin').value);
+    const curMax = emptyToNull(root.querySelector('#sc-sal-fcmax') && root.querySelector('#sc-sal-fcmax').value);
+    const tgtMin = emptyToNull(root.querySelector('#sc-sal-ftmin') && root.querySelector('#sc-sal-ftmin').value);
+    const tgtMax = emptyToNull(root.querySelector('#sc-sal-ftmax') && root.querySelector('#sc-sal-ftmax').value);
+    const wMin = emptyToNull(root.querySelector('#sc-sal-fwmin') && root.querySelector('#sc-sal-fwmin').value);
+    const wMax = emptyToNull(root.querySelector('#sc-sal-fwmax') && root.querySelector('#sc-sal-fwmax').value);
+    const hMin = emptyToNull(root.querySelector('#sc-sal-fhmin') && root.querySelector('#sc-sal-fhmin').value);
+    const hMax = emptyToNull(root.querySelector('#sc-sal-fhmax') && root.querySelector('#sc-sal-fhmax').value);
+    if (!inRange(c.current, curMin, curMax)) return false;
+    if (tgtMin != null || tgtMax != null) {
+      if (!inRange(fieldTarget(c), tgtMin, tgtMax)) return false;
+    }
+    if (!inRange(c.welfare, wMin, wMax)) return false;
+    if (!inRange(c.hiring, hMin, hMax)) return false;
+    return true;
+  }
+
+  function listParent(corps) {
+    const first = corps.values().next().value;
+    return first && first.row ? first.row.parentNode : null;
+  }
+
+  function flowPageList(corps, root) {
+    const parent = listParent(corps);
+    if (!parent) return;
+    const key = (root.querySelector('#sc-sal-sort') || {}).value || settings.sortKey;
+    const dir = ((root.querySelector('#sc-sal-dir') || {}).value || settings.sortDir) === 'desc' ? -1 : 1;
+    const items = [];
+    corps.forEach(function (c) { items.push(c); });
+    items.sort(function (a, b) {
+      let cmp = 0;
+      if (key === 'original') cmp = a.origIndex - b.origIndex;
+      else if (key === 'name') cmp = a.name.localeCompare(b.name);
+      else if (key === 'product') cmp = a.product.localeCompare(b.product) || a.name.localeCompare(b.name);
+      else if (key === 'section') cmp = a.section.localeCompare(b.section) || a.name.localeCompare(b.name);
+      else if (key === 'current') cmp = a.current - b.current;
+      else if (key === 'target') cmp = fieldTarget(a) - fieldTarget(b);
+      else if (key === 'increase') cmp = fieldIncrease(a) - fieldIncrease(b);
+      else if (key === 'welfare') cmp = a.welfare - b.welfare;
+      else if (key === 'hiring') cmp = a.hiring - b.hiring;
+      else cmp = a.origIndex - b.origIndex;
+      if (key === 'original') return cmp;
+      return cmp * dir || (a.origIndex - b.origIndex);
+    });
+
+    const chrome = [];
+    Array.prototype.forEach.call(parent.children, function (tr) {
+      if (tr.getAttribute && tr.getAttribute('data-sc-sal-chrome') === '1') chrome.push(tr);
+    });
+
+    items.forEach(function (c) {
+      c.row.classList.toggle('sc-sal-hide', !matchesView(c, root));
+    });
+
+    if (key === 'original') {
+      chrome.forEach(function (tr) { tr.classList.remove('sc-sal-hide'); });
+      const orig = corps._origRows || [];
+      orig.forEach(function (tr) {
+        if (tr && tr.parentNode === parent) parent.appendChild(tr);
+      });
+      return;
+    }
+
+    chrome.forEach(function (tr) { tr.classList.add('sc-sal-hide'); });
+    items.forEach(function (c) { parent.appendChild(c.row); });
+  }
+
+  function buildPanel(form, corps) {
+    if (document.getElementById('sc-sal-root')) return;
+    const types = {};
+    const secs = {};
+    corps.forEach(function (c) {
+      types[c.product] = (types[c.product] || 0) + 1;
+      secs[c.section] = (secs[c.section] || 0) + 1;
+    });
+    const typeNames = Object.keys(types).sort();
+    const secNames = Object.keys(secs);
+
+    function opt(val, label, cur) {
+      return '<option value="' + val + '"' + (cur === val ? ' selected' : '') + '>' + label + '</option>';
+    }
+
+    const root = document.createElement('div');
+    root.id = 'sc-sal-root';
+    if (!settings.panelOpen) root.classList.add('sc-sal-collapsed');
+    root.innerHTML =
+      '<div class="sc-sal-head" id="sc-sal-drag">' +
+        '<h3>Salary Toolbox</h3>' +
+        '<button type="button" id="sc-sal-toggle">' + (settings.panelOpen ? '–' : '+') + '</button>' +
+      '</div>' +
+      '<div class="sc-sal-body">' +
+        '<div class="sc-sal-help">Check the box left of the icon to select a corporation. Sort only reorders the page list. Save with the site button.</div>' +
+
+        '<div class="sc-sal-section">' +
+          '<h4>Sort / filter list</h4>' +
+          '<div class="sc-sal-row">' +
+            '<select id="sc-sal-sort">' +
+              opt('original', 'Original order', settings.sortKey) +
+              opt('name', 'Name', settings.sortKey) +
+              opt('product', 'Product type', settings.sortKey) +
+              opt('section', 'Section', settings.sortKey) +
+              opt('current', 'Current index', settings.sortKey) +
+              opt('target', 'Target', settings.sortKey) +
+              opt('increase', 'Increase %', settings.sortKey) +
+              opt('welfare', 'Welfare', settings.sortKey) +
+              opt('hiring', 'Hiring', settings.sortKey) +
+            '</select>' +
+            '<select id="sc-sal-dir">' +
+              opt('asc', 'Asc', settings.sortDir) +
+              opt('desc', 'Desc', settings.sortDir) +
+            '</select>' +
+          '</div>' +
+          '<input type="text" id="sc-sal-search" placeholder="Filter by name or product…" autocomplete="off">' +
+          '<div class="sc-sal-chips" id="sc-sal-secs">' +
+            secNames.map(function (s) {
+              return '<button type="button" class="sc-sal-chip" data-val="' + s.replace(/"/g, '') + '">' + s + ' ' + secs[s] + '</button>';
+            }).join('') +
+          '</div>' +
+          '<div class="sc-sal-chips" id="sc-sal-groups">' +
+            '<button type="button" class="sc-sal-chip" data-val="military">Military</button>' +
+            '<button type="button" class="sc-sal-chip" data-val="industry">Industry</button>' +
+            '<button type="button" class="sc-sal-chip" data-val="civilian">Civilian</button>' +
+          '</div>' +
+          '<div class="sc-sal-chips" id="sc-sal-types">' +
+            typeNames.map(function (t) {
+              return '<button type="button" class="sc-sal-chip" data-val="' + t.replace(/"/g, '&quot;') + '">' + t + ' ' + types[t] + '</button>';
+            }).join('') +
+          '</div>' +
+          '<div class="sc-sal-row">' +
+            '<label>Cur <input class="sc-sal-mini" type="number" id="sc-sal-fcmin" placeholder="min" value="' + settings.filterCurMin + '"></label>' +
+            '<label>– <input class="sc-sal-mini" type="number" id="sc-sal-fcmax" placeholder="max" value="' + settings.filterCurMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-sal-row">' +
+            '<label>Tgt <input class="sc-sal-mini" type="number" id="sc-sal-ftmin" placeholder="min" value="' + settings.filterTgtMin + '"></label>' +
+            '<label>– <input class="sc-sal-mini" type="number" id="sc-sal-ftmax" placeholder="max" value="' + settings.filterTgtMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-sal-row">' +
+            '<label>Wel <input class="sc-sal-mini" type="number" id="sc-sal-fwmin" placeholder="min" value="' + settings.filterWelMin + '"></label>' +
+            '<label>– <input class="sc-sal-mini" type="number" id="sc-sal-fwmax" placeholder="max" value="' + settings.filterWelMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-sal-row">' +
+            '<label>Hire <input class="sc-sal-mini" type="number" id="sc-sal-fhmin" placeholder="min" value="' + settings.filterHireMin + '"></label>' +
+            '<label>– <input class="sc-sal-mini" type="number" id="sc-sal-fhmax" placeholder="max" value="' + settings.filterHireMax + '"></label>' +
+          '</div>' +
+          '<div class="sc-sal-row">' +
+            '<label>Mode <select id="sc-sal-fmode">' +
+              opt('any', 'Any strategy', settings.filterMode) +
+              opt('1', 'Target index', settings.filterMode) +
+              opt('0', 'Increase %', settings.filterMode) +
+            '</select></label>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-sal-section">' +
+          '<h4>Selection</h4>' +
+          '<div class="sc-sal-actions">' +
+            '<button type="button" class="sc-btn" data-sel="all">Check visible</button>' +
+            '<button type="button" class="sc-btn alt" data-sel="none">Uncheck all</button>' +
+            '<button type="button" class="sc-btn alt" data-sel="invert">Invert visible</button>' +
+            '<button type="button" class="sc-btn" data-sel="military">Check military</button>' +
+            '<button type="button" class="sc-btn" data-sel="industry">Check industry</button>' +
+            '<button type="button" class="sc-btn" data-sel="civilian">Check civilian</button>' +
+          '</div>' +
+          '<div class="sc-sal-status" id="sc-sal-count"></div>' +
+        '</div>' +
+
+        '<div class="sc-sal-section">' +
+          '<h4>Set salaries</h4>' +
+          '<div class="sc-sal-row">' +
+            '<label>Mode <select id="sc-sal-mode">' +
+              opt('1', 'Target index', settings.mode) +
+              opt('0', 'Increase %', settings.mode) +
+            '</select></label>' +
+          '</div>' +
+          '<div class="sc-sal-row">' +
+            '<label>Target <input type="number" id="sc-sal-target" min="0" max="999" step="0.1" value="' + settings.target + '"></label>' +
+            '<label>Inc % <input type="number" id="sc-sal-inc" min="0" max="999" step="0.1" value="' + settings.increase + '"></label>' +
+          '</div>' +
+          '<div class="sc-sal-actions">' +
+            '<button type="button" class="sc-btn ok" data-act="apply">Apply to checked</button>' +
+            '<button type="button" class="sc-btn" data-act="target-300">Target 300</button>' +
+            '<button type="button" class="sc-btn" data-act="target-current">Target = current</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-sal-section">' +
+          '<h4>Named revisions</h4>' +
+          '<div class="sc-sal-help">New corporations added later are left unchanged on restore.</div>' +
+          '<input type="text" id="sc-sal-revname" placeholder="Revision name…" autocomplete="off">' +
+          '<div class="sc-sal-actions">' +
+            '<button type="button" class="sc-btn ok" data-rev="save">Save all</button>' +
+            '<button type="button" class="sc-btn" data-rev="save-checked">Save checked</button>' +
+          '</div>' +
+          '<select id="sc-sal-revlist"></select>' +
+          '<div class="sc-sal-actions">' +
+            '<button type="button" class="sc-btn ok" data-rev="restore">Restore</button>' +
+            '<button type="button" class="sc-btn alt" data-rev="rename">Rename</button>' +
+            '<button type="button" class="sc-btn alt" data-rev="delete">Delete</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="sc-sal-status" id="sc-sal-msg">Ready. Use Set Salary Changes on the page to save.</div>' +
+      '</div>';
+
+    document.body.appendChild(root);
+    fillRevisionSelect(root);
+    wirePanel(root, form, corps);
+    makeDraggable(root, root.querySelector('#sc-sal-drag'));
+    flowPageList(corps, root);
+    refreshCount(corps);
+  }
+
+  function refreshCount(corps) {
+    const root = document.getElementById('sc-sal-root');
+    if (!root) return;
+    let vis = 0;
+    corps.forEach(function (c) { if (matchesView(c, root)) vis += 1; });
+    const el = root.querySelector('#sc-sal-count');
+    if (el) el.textContent = selectedList(corps).length + ' checked · ' + vis + ' listed · ' + corps.size + ' total';
+  }
+
+  function persist(root) {
+    settings.target = num(root.querySelector('#sc-sal-target').value);
+    settings.increase = num(root.querySelector('#sc-sal-inc').value);
+    settings.mode = root.querySelector('#sc-sal-mode').value;
+    settings.sortKey = root.querySelector('#sc-sal-sort').value;
+    settings.sortDir = root.querySelector('#sc-sal-dir').value;
+    settings.filterCurMin = root.querySelector('#sc-sal-fcmin').value;
+    settings.filterCurMax = root.querySelector('#sc-sal-fcmax').value;
+    settings.filterTgtMin = root.querySelector('#sc-sal-ftmin').value;
+    settings.filterTgtMax = root.querySelector('#sc-sal-ftmax').value;
+    settings.filterWelMin = root.querySelector('#sc-sal-fwmin').value;
+    settings.filterWelMax = root.querySelector('#sc-sal-fwmax').value;
+    settings.filterHireMin = root.querySelector('#sc-sal-fhmin').value;
+    settings.filterHireMax = root.querySelector('#sc-sal-fhmax').value;
+    settings.filterMode = root.querySelector('#sc-sal-fmode').value;
+    saveSettings();
+  }
+
+  function say(text) {
+    const el = document.querySelector('#sc-sal-msg');
+    if (el) el.textContent = text;
+  }
+
+  function fillRevisionSelect(root, keepId) {
+    const sel = root.querySelector('#sc-sal-revlist');
+    if (!sel) return;
+    const pack = loadRevisions();
+    const items = pack.items.slice().sort(function (a, b) {
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+    const current = keepId || sel.value;
+    sel.innerHTML = '';
+    if (!items.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '(no revisions saved)';
+      sel.appendChild(o);
+      return;
+    }
+    items.forEach(function (rev) {
+      const o = document.createElement('option');
+      o.value = rev.id;
+      const n = (rev.corps && rev.corps.length) || 0;
+      const when = rev.savedAt ? String(rev.savedAt).replace('T', ' ').slice(0, 16) : '';
+      o.textContent = rev.name + ' · ' + n + ' corps' + (when ? ' · ' + when : '');
+      sel.appendChild(o);
+    });
+    if (current && sel.querySelector('option[value="' + current + '"]')) sel.value = current;
+  }
+
+  function selectedRevision(root) {
+    const id = (root.querySelector('#sc-sal-revlist') || {}).value;
+    if (!id) return null;
+    const pack = loadRevisions();
+    for (let i = 0; i < pack.items.length; i++) {
+      if (pack.items[i].id === id) return pack.items[i];
+    }
+    return null;
+  }
+
+  function newRevisionId() {
+    return 'sal-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function wirePanel(root, form, corps) {
+    root.querySelector('#sc-sal-toggle').addEventListener('click', function () {
+      settings.panelOpen = !settings.panelOpen;
+      root.classList.toggle('sc-sal-collapsed', !settings.panelOpen);
+      root.querySelector('#sc-sal-toggle').textContent = settings.panelOpen ? '–' : '+';
+      saveSettings();
+    });
+
+    function relist() {
+      persist(root);
+      flowPageList(corps, root);
+      refreshCount(corps);
+    }
+
+    ['#sc-sal-search', '#sc-sal-sort', '#sc-sal-dir', '#sc-sal-fmode',
+      '#sc-sal-fcmin', '#sc-sal-fcmax', '#sc-sal-ftmin', '#sc-sal-ftmax',
+      '#sc-sal-fwmin', '#sc-sal-fwmax', '#sc-sal-fhmin', '#sc-sal-fhmax'
+    ].forEach(function (sid) {
+      const el = root.querySelector(sid);
+      if (!el) return;
+      el.addEventListener('input', relist);
+      el.addEventListener('change', relist);
+    });
+
+    root.querySelectorAll('.sc-sal-chips').forEach(function (wrap) {
+      wrap.addEventListener('click', function (ev) {
+        const chip = ev.target.closest('.sc-sal-chip');
+        if (!chip) return;
+        chip.dataset.on = chip.dataset.on === '1' ? '0' : '1';
+        flowPageList(corps, root);
+        refreshCount(corps);
+      });
+    });
+
+    form.addEventListener('change', function (ev) {
+      if (ev.target && ev.target.classList && ev.target.classList.contains('sc-sal-pick')) {
+        const row = ev.target.closest('tr');
+        if (row) row.classList.toggle('sc-sal-selected', ev.target.checked);
+        refreshCount(corps);
+      }
+    });
+
+    root.addEventListener('change', function () { persist(root); });
+
+    root.addEventListener('click', function (ev) {
+      const selBtn = ev.target.closest('[data-sel]');
+      if (selBtn) {
+        runSelection(selBtn.getAttribute('data-sel'), corps, root);
+        refreshCount(corps);
+        return;
+      }
+      const revBtn = ev.target.closest('[data-rev]');
+      if (revBtn) {
+        persist(root);
+        runRevision(revBtn.getAttribute('data-rev'), form, corps, root);
+        flowPageList(corps, root);
+        refreshCount(corps);
+        return;
+      }
+      const actBtn = ev.target.closest('[data-act]');
+      if (actBtn) {
+        persist(root);
+        runAction(actBtn.getAttribute('data-act'), form, corps, root);
+        flowPageList(corps, root);
+        refreshCount(corps);
+      }
+    });
+  }
+
+  function runSelection(kind, corps, root) {
+    corps.forEach(function (c) {
+      const listed = matchesView(c, root);
+      let on = isSelected(c);
+      if (kind === 'all') on = listed;
+      else if (kind === 'none') on = false;
+      else if (kind === 'invert') on = listed ? !on : on;
+      else if (kind === 'military' || kind === 'industry' || kind === 'civilian') on = listed && c.group === kind;
+      setSelected(c, on);
+    });
+  }
+
+  function runAction(act, form, corps, root) {
+    const list = selectedList(corps);
+    if (!list.length) {
+      say('Check one or more corporations first.');
+      return;
+    }
+    const mode = root.querySelector('#sc-sal-mode').value;
+    const tgt = num(root.querySelector('#sc-sal-target').value);
+    const inc = num(root.querySelector('#sc-sal-inc').value);
+    let summary = '';
+    if (act === 'apply') {
+      summary = mode === '0'
+        ? 'Set checked corps to Increase By ' + inc + '%.'
+        : 'Set checked corps to Target salary index ' + tgt + '.';
+    } else if (act === 'target-300') {
+      summary = 'Set checked corps to Target 300.';
+    } else if (act === 'target-current') {
+      summary = 'Set each checked corp target equal to its current index.';
+    }
+    if (!window.confirm(summary + '\n\n' + list.length + ' corporation' + (list.length === 1 ? '' : 's') +
+        ' will be updated in the form.\nNothing is saved until you click "Set Salary Changes".\n\nContinue?')) {
+      say('Cancelled.');
+      return;
+    }
+    list.forEach(function (c) {
+      if (act === 'apply') applySalary(c, mode, inc, tgt);
+      else if (act === 'target-300') applySalary(c, '1', 0, 300);
+      else if (act === 'target-current') applySalary(c, '1', 0, c.current);
+    });
+    say('Updated ' + list.length + ' corporation' + (list.length === 1 ? '' : 's') + '. Review, then use Set Salary Changes.');
+  }
+
+  function runRevision(kind, form, corps, root) {
+    const pack = loadRevisions();
+    const nameBox = root.querySelector('#sc-sal-revname');
+
+    if (kind === 'save' || kind === 'save-checked') {
+      const name = String(nameBox && nameBox.value || '').replace(/\s+/g, ' ').trim();
+      if (!name) {
+        say('Enter a revision name first.');
+        return;
+      }
+      const source = kind === 'save-checked' ? selectedList(corps) : [];
+      if (kind === 'save-checked' && !source.length) {
+        say('Check corporations to include, or Save all.');
+        return;
+      }
+      const snaps = [];
+      if (kind === 'save') corps.forEach(function (c) { snaps.push(snapshotCorp(c)); });
+      else source.forEach(function (c) { snaps.push(snapshotCorp(c)); });
+      const existing = pack.items.filter(function (r) { return normName(r.name) === normName(name); })[0];
+      if (existing) {
+        if (!window.confirm('Overwrite revision "' + existing.name + '"?')) {
+          say('Save cancelled.');
+          return;
+        }
+        existing.savedAt = new Date().toISOString();
+        existing.corps = snaps;
+        existing.format = REVISION_FORMAT;
+        existing.scope = kind === 'save-checked' ? 'checked' : 'all';
+      } else {
+        pack.items.push({
+          id: newRevisionId(),
+          format: REVISION_FORMAT,
+          name: name,
+          savedAt: new Date().toISOString(),
+          scope: kind === 'save-checked' ? 'checked' : 'all',
+          corps: snaps
+        });
+      }
+      storeRevisions(pack);
+      fillRevisionSelect(root, existing ? existing.id : pack.items[pack.items.length - 1].id);
+      say('Saved "' + name + '" (' + snaps.length + ' corps).');
+      return;
+    }
+
+    const rev = selectedRevision(root);
+    if (!rev) {
+      say('Pick a saved revision first.');
+      return;
+    }
+
+    if (kind === 'delete') {
+      if (!window.confirm('Delete revision "' + rev.name + '"?')) return;
+      pack.items = pack.items.filter(function (r) { return r.id !== rev.id; });
+      storeRevisions(pack);
+      fillRevisionSelect(root);
+      say('Deleted "' + rev.name + '".');
+      return;
+    }
+
+    if (kind === 'rename') {
+      const name = String(nameBox && nameBox.value || '').replace(/\s+/g, ' ').trim();
+      if (!name) {
+        say('Type the new name in the revision name box.');
+        return;
+      }
+      rev.name = name;
+      storeRevisions(pack);
+      fillRevisionSelect(root, rev.id);
+      say('Renamed revision to "' + name + '".');
+      return;
+    }
+
+    if (kind === 'restore') {
+      const snaps = Array.isArray(rev.corps) ? rev.corps : [];
+      const indexes = buildIndexes(corps);
+      const matched = [];
+      let missing = 0;
+      snaps.forEach(function (snap) {
+        const c = matchSnapshot(snap, indexes);
+        if (c) matched.push({ c: c, snap: snap });
+        else missing += 1;
+      });
+      let unmatchedNew = 0;
+      const used = {};
+      matched.forEach(function (m) { used[m.c.id] = true; });
+      corps.forEach(function (c) { if (!used[c.id]) unmatchedNew += 1; });
+      if (!window.confirm(
+        'Restore "' + rev.name + '"?\n\n' +
+        matched.length + ' current corporations will be updated.\n' +
+        missing + ' saved items are gone and will be skipped.\n' +
+        unmatchedNew + ' newer corporations have no snapshot and stay as they are.\n\n' +
+        'This only fills the form. Click "Set Salary Changes" to save.'
+      )) {
+        say('Restore cancelled.');
+        return;
+      }
+      matched.forEach(function (m) {
+        applySalary(m.c, m.snap.mode, m.snap.increase, m.snap.target);
+      });
+      say('Restored "' + rev.name + '": ' + matched.length + ' updated, ' + missing + ' skipped, ' + unmatchedNew + ' new untouched.');
+    }
+  }
+
+  function makeDraggable(box, handle) {
+    let drag = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    handle.addEventListener('mousedown', function (ev) {
+      if (ev.target.closest('button')) return;
+      drag = true;
+      sx = ev.clientX;
+      sy = ev.clientY;
+      const rect = box.getBoundingClientRect();
+      ox = rect.left;
+      oy = rect.top;
+      ev.preventDefault();
+    });
+    window.addEventListener('mousemove', function (ev) {
+      if (!drag) return;
+      box.style.left = Math.max(0, ox + ev.clientX - sx) + 'px';
+      box.style.top = Math.max(0, oy + ev.clientY - sy) + 'px';
+      box.style.right = 'auto';
+    });
+    window.addEventListener('mouseup', function () { drag = false; });
+  }
+
+  function init() {
+    if (!pageMatches()) return;
+    if (document.documentElement.getAttribute(INIT_FLAG) === '1' && document.getElementById('sc-sal-root')) return;
+    const form = findForm();
+    if (!form) return;
+    const corps = collectCorps(form);
+    if (!corps.size) return;
+    document.documentElement.setAttribute(INIT_FLAG, '1');
+    installPickboxes(corps);
+    buildPanel(form, corps);
+  }
+
+  function start() {
+    init();
+    const obs = new MutationObserver(function () {
+      if (pageMatches() && !document.getElementById('sc-sal-root')) {
+        document.documentElement.removeAttribute(INIT_FLAG);
+        init();
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+})();
