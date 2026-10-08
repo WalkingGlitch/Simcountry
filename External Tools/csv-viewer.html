@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSV Viewer</title>
+<style>
+  :root {
+    --ink: #1b1f23;
+    --muted: #5c6770;
+    --line: #c5ced6;
+    --head: #336699;
+    --bg: #f4f6f8;
+    --card: #fff;
+    --in: #0a7a20;
+    --out: #b00000;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.4 "Segoe UI", arial, helvetica, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  header, main { width: min(1440px, calc(100% - 32px)); margin: 0 auto; }
+  header { padding: 18px 0 8px; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .sub { margin: 0; color: var(--muted); font-size: 13px; }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+    margin: 12px 0;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #243038; }
+  input[type="text"], input[type="number"], input[type="search"], select {
+    font: inherit;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: #fff;
+    color: var(--ink);
+  }
+  input[type="number"] { width: 7em; }
+  button {
+    font: inherit;
+    padding: 5px 10px;
+    border: 1px solid #8aa0b4;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+  }
+  button:hover { background: #eef4f9; }
+  button.primary { background: var(--head); color: #fff; border-color: var(--head); }
+  button.primary:hover { background: #2b5780; }
+  .stat { margin: 8px 0 0; color: #333; font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip {
+    display: inline-flex; gap: 6px; align-items: center;
+    background: #eef3f8; border: 1px solid #c5d4e4; border-radius: 99px;
+    padding: 2px 8px; font-size: 12px;
+  }
+  .chip button { border: 0; background: transparent; padding: 0 2px; }
+  .frame { border: 1px solid #4b4b4b; background: #fff; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; }
+  th, td {
+    padding: .28em .45em;
+    border-right: 1px solid rgba(75,75,75,.4);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #111;
+  }
+  th:last-child, td:last-child { border-right: none; }
+  thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--head); color: #fff; text-align: left; cursor: pointer;
+  }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr:nth-child(even) td { background: rgba(51,102,153,.06); }
+  #tip {
+    position: fixed; z-index: 20; display: none; max-width: 440px;
+    background: #fff; color: #111; border: 1px solid #4b4b4b;
+    box-shadow: 0 8px 22px rgba(0,0,0,.3);
+    padding: 8px 10px; font: 13px arial, helvetica, sans-serif;
+    white-space: pre-wrap; pointer-events: none;
+  }
+  .warn { color: #8a4b00; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CSV Viewer</h1>
+  <p class="sub">Open a local CSV. Caps, sorting, filtering, and find/replace run in this page. The original file is not changed until you export.</p>
+</header>
+<main>
+  <section class="panel">
+    <div class="row">
+      <label>Open <input id="file" type="file" accept=".csv,text/csv,text/plain"></label>
+      <label>Delimiter
+        <select id="delim">
+          <option value="auto">Auto</option>
+          <option value=",">Comma</option>
+          <option value=";">Semicolon</option>
+          <option value="	">Tab</option>
+        </select>
+      </label>
+      <label>File cap MB <input id="capMb" type="number" min="1" step="1" value="10"></label>
+      <label>Row cap <input id="capRows" type="number" min="1" step="1000" value="100000"></label>
+      <label>Column cap <input id="capCols" type="number" min="1" step="1" value="50"></label>
+      <button id="applyCaps" type="button">Apply caps</button>
+      <label><input id="header" type="checkbox" checked> First row is header</label>
+    </div>
+    <p id="stat" class="stat">No file loaded.</p>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <label>Find in view <input id="global" type="search" placeholder="any column"></label>
+      <label>Column
+        <select id="fcol"><option value="-1">Any</option></select>
+      </label>
+      <label>Op
+        <select id="fop">
+          <option value="contains">contains</option>
+          <option value="not">does not contain</option>
+          <option value="eq">equals</option>
+          <option value="empty">is empty</option>
+          <option value="nempty">is not empty</option>
+          <option value="gt">number ></option>
+          <option value="lt">number <</option>
+          <option value="between">number between</option>
+          <option value="regex">regex</option>
+        </select>
+      </label>
+      <input id="fval" type="text" placeholder="value">
+      <input id="fval2" type="text" placeholder="and" hidden>
+      <button id="addFilter" type="button">Add filter</button>
+      <button id="clearFilters" type="button">Clear filters</button>
+    </div>
+    <div id="chips" class="chips"></div>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <label>Find <input id="find" type="text" placeholder="text or pattern"></label>
+      <label>Replace <input id="repl" type="text" placeholder="replacement"></label>
+      <label><input id="regex" type="checkbox"> Regex</label>
+      <label>Flags <input id="flags" type="text" value="g" style="width:4em"></label>
+      <label>Scope
+        <select id="scope">
+          <option value="filtered">Filtered rows</option>
+          <option value="all">All loaded rows</option>
+        </select>
+      </label>
+      <label>Column
+        <select id="rcol"><option value="-1">All columns</option></select>
+      </label>
+      <button id="count" type="button">Count matches</button>
+      <button id="replace" class="primary" type="button">Replace</button>
+      <button id="undo" type="button" disabled>Undo</button>
+      <button id="exportView" type="button">Export filtered</button>
+      <button id="exportAll" type="button">Export loaded</button>
+    </div>
+    <p id="repstat" class="stat"></p>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <button id="resetSort" type="button">Reset sort</button>
+      <span id="win" class="stat"></span>
+    </div>
+    <div class="frame" style="margin-top:8px">
+      <table>
+        <thead id="thead"></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<div id="tip"></div>
+<script>
+(function () {
+  var PASS = 1000;
+  var applied = { mb: 10, rows: 100000, cols: 50 };
+  var headers = [];
+  var rows = [];
+  var kinds = [];
+  var filters = [];
+  var sortKeys = [];
+  var undo = null;
+  var fileName = 'table';
+  var notes = [];
+  var sourceText = '';
+  var sourceName = '';
+  var paintToken = 0;
+
+  var el = function (id) { return document.getElementById(id); };
+  var tip = el('tip');
+  var tipTimer = null;
+
+  function capMb() { return applied.mb; }
+  function capRows() { return applied.rows; }
+  function capCols() { return applied.cols; }
+  function applyCaps() {
+    var mb = parseFloat(el('capMb').value);
+    var rowN = parseInt(el('capRows').value, 10);
+    var colN = parseInt(el('capCols').value, 10);
+    applied.mb = mb > 0 ? mb : 10;
+    applied.rows = rowN > 0 ? rowN : 100000;
+    applied.cols = colN > 0 ? colN : 50;
+    if (sourceText) loadText(sourceName, sourceText, true);
+    else el('stat').textContent = 'Caps set: ' + applied.mb + ' MB, ' + applied.rows.toLocaleString() + ' rows, ' + applied.cols + ' columns.';
+  }
+
+  function sniff(text) {
+    var choice = el('delim').value;
+    if (choice !== 'auto') return choice;
+    var line = text.split(/\r?\n/, 1)[0] || '';
+    var counts = { ',': 0, ';': 0, '\t': 0 };
+    var q = false;
+    for (var i = 0; i < line.length; i++) {
+      var c = line[i];
+      if (c === '"') q = !q;
+      else if (!q && counts[c] != null) counts[c]++;
+    }
+    return counts[';'] > counts[','] && counts[';'] >= counts['\t'] ? ';' : counts['\t'] > counts[','] ? '\t' : ',';
+  }
+
+  function parseCsv(text, delim, rowCap, colCap) {
+    var out = [];
+    var row = [];
+    var field = '';
+    var q = false;
+    var cutRows = false;
+    var cutCols = false;
+    function pushField() {
+      if (row.length < colCap) row.push(field);
+      else cutCols = true;
+      field = '';
+    }
+    function pushRow() {
+      pushField();
+      if (row.some(function (c) { return c !== ''; }) || out.length) {
+        if (out.length < rowCap) out.push(row);
+        else cutRows = true;
+      }
+      row = [];
+    }
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (q) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else q = false;
+        } else field += c;
+      } else if (c === '"') q = true;
+      else if (c === delim) pushField();
+      else if (c === '\n') { pushRow(); if (cutRows) break; }
+      else if (c === '\r') { if (text[i + 1] === '\n') i++; pushRow(); if (cutRows) break; }
+      else field += c;
+    }
+    if (!cutRows && (field !== '' || row.length)) pushRow();
+    return { rows: out, cutRows: cutRows, cutCols: cutCols };
+  }
+
+  function parseNumber(raw) {
+    if (raw == null) return null;
+    var s = String(raw).trim().replace(/[$€£¥]/g, '').replace(/\s/g, '');
+    if (!s || !/\d/.test(s)) return null;
+    var neg = /^\(|^-/.test(s);
+    s = s.replace(/[()]/g, '').replace(/,/g, '');
+    var m = s.match(/^([+-]?\d+(?:\.\d+)?)([KMBT])?$/i);
+    if (!m) return null;
+    var n = parseFloat(m[1]);
+    var suf = (m[2] || '').toUpperCase();
+    n *= suf === 'T' ? 1e12 : suf === 'B' ? 1e9 : suf === 'M' ? 1e6 : suf === 'K' ? 1e3 : 1;
+    if (neg && n > 0) n = -n;
+    return isFinite(n) ? n : null;
+  }
+  function parseDate(raw) {
+    var s = String(raw || '').trim();
+    if (!s) return null;
+    var iso = Date.parse(s);
+    if (!isNaN(iso) && /\d{4}/.test(s)) return iso;
+    var months = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+    var m = s.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\d{3,5})$/);
+    if (m && months[m[1].slice(0,3).toLowerCase()] != null) return Date.UTC(+m[3], months[m[1].slice(0,3).toLowerCase()], +m[2]);
+    return null;
+  }
+  function detectKinds(body) {
+    return headers.map(function (_, col) {
+      var num = 0, date = 0, text = 0, seen = 0;
+      for (var i = 0; i < body.length && seen < 25; i++) {
+        var v = body[i][col];
+        if (v == null || String(v).trim() === '') continue;
+        seen++;
+        if (parseNumber(v) != null) num++;
+        else if (parseDate(v) != null) date++;
+        else text++;
+      }
+      if (num >= date && num >= text && num > 0) return 'num';
+      if (date > text && date > 0) return 'date';
+      return 'text';
+    });
+  }
+
+  function loadText(name, text, keepView) {
+    sourceName = name;
+    sourceText = text;
+    fileName = name.replace(/\.[^.]+$/, '') || 'table';
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    var delim = sniff(text);
+    var parsed = parseCsv(text, delim, capRows() + (el('header').checked ? 1 : 0), capCols());
+    var all = parsed.rows;
+    if (el('header').checked && all.length) {
+      headers = all[0].map(function (h, i) { return String(h || '').trim() || ('Column ' + (i + 1)); });
+      rows = all.slice(1);
+    } else {
+      var width = all.reduce(function (m, r) { return Math.max(m, r.length); }, 0);
+      headers = [];
+      for (var i = 0; i < width; i++) headers.push('Column ' + (i + 1));
+      rows = all;
+    }
+    rows.forEach(function (r) { while (r.length < headers.length) r.push(''); });
+    kinds = detectKinds(rows);
+    if (!keepView) { filters = []; sortKeys = []; }
+    undo = null;
+    notes = [];
+    notes.push(rows.length.toLocaleString() + ' rows, ' + headers.length + ' columns, delimiter ' + (delim === '\t' ? 'tab' : delim));
+    if (parsed.cutRows) notes.push('stopped at the row cap');
+    if (parsed.cutCols) notes.push('extra columns dropped');
+    fillColumnSelects();
+    drawFilters();
+    render();
+  }
+
+  function fillColumnSelects() {
+    ['fcol', 'rcol'].forEach(function (id) {
+      var sel = el(id);
+      var any = id === 'rcol' ? 'All columns' : 'Any';
+      sel.innerHTML = '<option value="-1">' + any + '</option>';
+      headers.forEach(function (h, i) {
+        var o = document.createElement('option');
+        o.value = String(i);
+        o.textContent = h;
+        sel.appendChild(o);
+      });
+    });
+  }
+
+  function rowMatches(row) {
+    var q = el('global').value.trim().toLowerCase();
+    if (q && row.join(' ').toLowerCase().indexOf(q) === -1) return false;
+    for (var i = 0; i < filters.length; i++) {
+      var f = filters[i];
+      var cols = f.col < 0 ? row : [row[f.col] || ''];
+      var ok = false;
+      for (var c = 0; c < cols.length; c++) {
+        var cell = cols[c] || '';
+        if (f.op === 'contains' && cell.toLowerCase().indexOf(f.a.toLowerCase()) !== -1) ok = true;
+        else if (f.op === 'not' && cell.toLowerCase().indexOf(f.a.toLowerCase()) === -1) ok = true;
+        else if (f.op === 'eq' && cell.toLowerCase() === f.a.toLowerCase()) ok = true;
+        else if (f.op === 'empty' && cell.trim() === '') ok = true;
+        else if (f.op === 'nempty' && cell.trim() !== '') ok = true;
+        else if (f.op === 'gt' && parseNumber(cell) != null && parseNumber(cell) > f.n) ok = true;
+        else if (f.op === 'lt' && parseNumber(cell) != null && parseNumber(cell) < f.n) ok = true;
+        else if (f.op === 'between' && parseNumber(cell) != null && parseNumber(cell) >= f.n && parseNumber(cell) <= f.n2) ok = true;
+        else if (f.op === 'regex') { try { if (new RegExp(f.a, 'i').test(cell)) ok = true; } catch (e) {} }
+      }
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+  function view() {
+    var idx = [];
+    for (var i = 0; i < rows.length; i++) if (rowMatches(rows[i])) idx.push(i);
+    if (!sortKeys.length) return idx;
+    var keys = sortKeys.slice();
+    idx.sort(function (ia, ib) {
+      var a = rows[ia], b = rows[ib];
+      for (var k = 0; k < keys.length; k++) {
+        var col = keys[k].col, dir = keys[k].dir;
+        var av, bv;
+        if (kinds[col] === 'num') { av = parseNumber(a[col]); bv = parseNumber(b[col]); if (av == null) av = Infinity; if (bv == null) bv = Infinity; }
+        else if (kinds[col] === 'date') { av = parseDate(a[col]); bv = parseDate(b[col]); if (av == null) av = Infinity; if (bv == null) bv = Infinity; }
+        else { av = (a[col] || '').toLowerCase(); bv = (b[col] || '').toLowerCase(); }
+        if (av < bv) return -dir;
+        if (av > bv) return dir;
+      }
+      return ia - ib;
+    });
+    return idx;
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"');
+  }
+
+  function render() {
+    var token = ++paintToken;
+    var idx = view();
+    var head = '<tr>' + headers.map(function (h, i) {
+      var mark = '';
+      sortKeys.forEach(function (k, n) { if (k.col === i) mark = (k.dir < 0 ? ' ↓' : ' ↑') + (sortKeys.length > 1 ? (n + 1) : ''); });
+      return '<th data-col="' + i + '" title="' + esc(h) + '">' + esc(h) + mark + '</th>';
+    }).join('') + '</tr>';
+    el('thead').innerHTML = head;
+    el('tbody').innerHTML = '';
+    el('stat').textContent = notes.join(' · ') || 'Loaded.';
+    el('undo').disabled = !undo;
+    var at = 0;
+    function pass() {
+      if (token !== paintToken) return;
+      var end = Math.min(at + PASS, idx.length);
+      var html = [];
+      for (var i = at; i < end; i++) {
+        var row = rows[idx[i]];
+        html.push('<tr>' + headers.map(function (_, c) {
+          var v = row[c] || '';
+          return '<td class="' + (kinds[c] === 'num' ? 'num' : '') + '" data-full="' + esc(v) + '">' + esc(v) + '</td>';
+        }).join('') + '</tr>');
+      }
+      if (html.length) el('tbody').insertAdjacentHTML('beforeend', html.join(''));
+      at = end;
+      el('win').textContent = at.toLocaleString() + ' shown of ' + idx.length.toLocaleString() + ' matching, ' + rows.length.toLocaleString() + ' loaded';
+      if (at < idx.length) setTimeout(pass, 0);
+    }
+    pass();
+  }
+
+  function drawFilters() {
+    el('chips').innerHTML = filters.map(function (f, i) {
+      var name = f.col < 0 ? 'Any' : headers[f.col];
+      return '<span class="chip">' + esc(name) + ' ' + esc(f.op) + ' ' + esc(f.a) + (f.op === 'between' ? ' – ' + esc(f.b) : '') + ' <button type="button" data-x="' + i + '">×</button></span>';
+    }).join('');
+  }
+
+  function safePattern(source, flags) {
+    if (source.length > 200) throw new Error('Pattern is too long');
+    if (/(\([^)]*[+*][^)]*\))[+*{]/.test(source)) throw new Error('Nested quantifiers are blocked');
+    var f = String(flags || '').replace(/[^gimsuy]/g, '');
+    if (f.indexOf('g') === -1) f += 'g';
+    return new RegExp(source, f);
+  }
+
+  function targets() {
+    var col = parseInt(el('rcol').value, 10);
+    var idx = el('scope').value === 'all' ? rows.map(function (_, i) { return i; }) : view();
+    return { col: col, idx: idx };
+  }
+
+  function countMatches() {
+    var src = el('find').value;
+    if (!src) { el('repstat').textContent = 'Enter a find value.'; return null; }
+    var pattern;
+    try { pattern = safePattern(el('regex').checked ? src : src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), el('flags').value); }
+    catch (e) { el('repstat').textContent = e.message; return null; }
+    var t = targets();
+    var cells = 0, hits = 0;
+    t.idx.forEach(function (ri) {
+      var row = rows[ri];
+      var from = t.col < 0 ? 0 : t.col;
+      var to = t.col < 0 ? row.length : t.col + 1;
+      for (var c = from; c < to; c++) {
+        var text = row[c] || '';
+        var m = text.match(pattern);
+        if (m && m.length) { cells++; hits += m.length; }
+      }
+    });
+    el('repstat').textContent = hits.toLocaleString() + ' matches in ' + cells.toLocaleString() + ' cells';
+    return { pattern: pattern, targets: t, hits: hits };
+  }
+
+  function csvCell(s) {
+    s = String(s == null ? '' : s);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function download(list, suffix) {
+    var lines = [headers.map(csvCell).join(',')];
+    list.forEach(function (ri) { lines.push(rows[ri].map(csvCell).join(',')); });
+    var blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fileName + '_' + suffix + '_' + list.length + 'rows.csv';
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  }
+
+  el('file').addEventListener('change', function () {
+    var file = el('file').files && el('file').files[0];
+    if (!file) return;
+    var limit = capMb() * 1024 * 1024;
+    if (file.size > limit) {
+      el('stat').innerHTML = '<span class="warn">' + file.name + ' is ' + (file.size / 1048576).toFixed(1) + ' MB, over the ' + capMb() + ' MB cap. Apply a higher cap, then choose it again.</span>';
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function () { loadText(file.name, String(reader.result || '')); };
+    reader.readAsText(file);
+  });
+  el('applyCaps').addEventListener('click', applyCaps);
+  el('global').addEventListener('input', function () { render(); });
+  el('fop').addEventListener('change', function () { el('fval2').hidden = el('fop').value !== 'between'; });
+  el('addFilter').addEventListener('click', function () {
+    var op = el('fop').value;
+    filters.push({ col: parseInt(el('fcol').value, 10), op: op, a: el('fval').value, b: el('fval2').value, n: parseNumber(el('fval').value), n2: parseNumber(el('fval2').value) });
+    drawFilters();
+    render();
+  });
+  el('clearFilters').addEventListener('click', function () { filters = []; el('global').value = ''; drawFilters(); render(); });
+  el('chips').addEventListener('click', function (ev) {
+    var b = ev.target.closest('button[data-x]');
+    if (!b) return;
+    filters.splice(parseInt(b.getAttribute('data-x'), 10), 1);
+    drawFilters();
+    render();
+  });
+  el('thead').addEventListener('click', function (ev) {
+    var th = ev.target.closest('th[data-col]');
+    if (!th) return;
+    var col = parseInt(th.getAttribute('data-col'), 10);
+    var existing = sortKeys.filter(function (k) { return k.col === col; })[0];
+    if (ev.shiftKey) {
+      if (existing) existing.dir = -existing.dir;
+      else sortKeys.push({ col: col, dir: kinds[col] === 'text' ? 1 : -1 });
+    } else {
+      var dir = existing ? -existing.dir : (kinds[col] === 'text' ? 1 : -1);
+      sortKeys = [{ col: col, dir: dir }];
+    }
+    render();
+  });
+  el('resetSort').addEventListener('click', function () { sortKeys = []; render(); });
+  el('count').addEventListener('click', countMatches);
+  el('replace').addEventListener('click', function () {
+    var found = countMatches();
+    if (!found || !found.hits) return;
+    var changes = [];
+    var repl = el('repl').value;
+    found.targets.idx.forEach(function (ri) {
+      var row = rows[ri];
+      var from = found.targets.col < 0 ? 0 : found.targets.col;
+      var to = found.targets.col < 0 ? row.length : found.targets.col + 1;
+      for (var c = from; c < to; c++) {
+        var text = row[c] || '';
+        found.pattern.lastIndex = 0;
+        if (!found.pattern.test(text)) continue;
+        found.pattern.lastIndex = 0;
+        changes.push({ ri: ri, c: c, prev: text });
+        row[c] = text.replace(found.pattern, repl);
+      }
+    });
+    undo = changes;
+    el('repstat').textContent = 'Replaced ' + changes.length.toLocaleString() + ' cells. Undo is available once.';
+    render();
+  });
+  el('undo').addEventListener('click', function () {
+    if (!undo) return;
+    undo.forEach(function (ch) { rows[ch.ri][ch.c] = ch.prev; });
+    undo = null;
+    el('repstat').textContent = 'Last replace undone.';
+    render();
+  });
+  el('exportView').addEventListener('click', function () { download(view(), 'filtered'); });
+  el('exportAll').addEventListener('click', function () { download(rows.map(function (_, i) { return i; }), 'loaded'); });
+
+  document.body.addEventListener('mouseover', function (ev) {
+    var td = ev.target.closest && ev.target.closest('td[data-full]');
+    clearTimeout(tipTimer);
+    if (!td) { tip.style.display = 'none'; return; }
+    tipTimer = setTimeout(function () {
+      tip.textContent = td.getAttribute('data-full') || '';
+      tip.style.display = 'block';
+      tip.style.left = Math.min(ev.clientX + 12, window.innerWidth - 460) + 'px';
+      tip.style.top = (ev.clientY + 16) + 'px';
+    }, 1000);
+  });
+  document.body.addEventListener('mouseout', function (ev) {
+    if (ev.target.closest && ev.target.closest('td[data-full]')) { clearTimeout(tipTimer); tip.style.display = 'none'; }
+  });
+})();
+</script>
+</body>
+</html>
