@@ -14,6 +14,7 @@ This repo is a small toolkit for people who already play. It does not replace th
 | [Order Strategies](Order%20Strategies) | 1.4.0 | Select, filter, preset, and snapshot stock-order strategies |
 | [Salary Tweaks](Salary%20Tweaks) | 1.1.0 | Select, filter, and bulk-set state corporation salaries |
 | [Portal.js](Portal.js) | 1.3.0 | Reorder countries/enterprises and flick the news ticker |
+| [Simcountry Cash Log — endless, sort, filter](Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) | 1.4.6 | Sort, filter, cap, and export the Cash Log without spacer columns |
 | [War Casualty Bookmarklet](3rd%20Party/War%20Casualty%20Bookmarklet.txt) | 3rd party | Summarize war losses from a battle report page |
 
 > Unofficial. Not affiliated with Simcountry or its operators. Use at your own risk, and stay inside the game's rules.
@@ -33,6 +34,7 @@ Raw files:
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Order%20Strategies`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Salary%20Tweaks`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/Portal.js`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter`
 
 Preferences are stored in Tampermonkey / `localStorage`. They stay on your machine.
 
@@ -159,6 +161,32 @@ Order and ticker prefs live in `localStorage` under `scEnhancer.v1`. From the co
 
 ---
 
+## Cash Log (endless, sort, filter)
+
+**File:** [`Simcountry Cash Log — endless, sort, filter`](Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) *(no `.js` extension; Tampermonkey still accepts it)*  
+**Userscript name:** Simcountry Cash Log — endless, sort, filter  
+**Author:** TheWalkingGlitch  
+**Runs on:** Country Finance → **Cash Log** (`miDesktopTab=6`, applet `cfinance`). The address bar stays put; the tab writes the applet into the desktop.
+
+Cash Log is not its own page. The script reads that applet payload, drops empty spacer and history-icon columns, and paints a second table of the text columns.
+
+### Features
+
+- **Click-to-sort** the loaded columns
+- **Filter** any column as you type
+- Flow filter: all, income, or spending (income in green, spending in red)
+- Game-month filter, with optional month-break rows
+- Row cap (on by default, 1000) so the crawl stops
+- **Load older** follows an older-page link in the cash-log response only. It does not guess `miFrom` / `miPageStartPos`
+- **Export CSV** of the visible rows (adds Month and signed amount)
+- Reset sort
+- Sticky headers; a hover tip shows text cut off by the column
+- Leaves profit & loss, year-to-date, and the other finance tables on that applet alone
+
+The older-page fetch goes to the game, and only when that link is in the cash-log response. It stops at the row cap.
+
+---
+
 ## War Casualty Bookmarklet (3rd party)
 
 **File:** [`3rd Party/War Casualty Bookmarklet.txt`](3rd%20Party/War%20Casualty%20Bookmarklet.txt)  
@@ -182,6 +210,7 @@ Simcountry/
 ├── Order Strategies
 ├── Salary Tweaks
 ├── Portal.js
+├── Simcountry Cash Log — endless, sort, filter
 ├── Salary Toolbox SS.png
 ├── LICENSE
 ├── README.md
@@ -201,6 +230,7 @@ Simcountry/
 - Batch loan submits reload the offer page once per offer, with a delay. Do not walk away from a 50-offer job if you care about the result.
 - Order-strategy and salary revisions live in userscript storage. Export nothing you cannot rebuild.
 - Portal sort order is local to that browser. It will not follow you to another machine.
+- Cash Log only paints when that finance tab is open. Load older follows a next link in the applet response and stops at the row cap (default 1000). It does not invent page parameters.
 - Unofficial tools can sit in a grey area of a game's rules. If Simcountry says no, stop.
 
 ---
