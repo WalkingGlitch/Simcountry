@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simcountry Cash Log — endless, sort, filter
 // @namespace    https://simcountry.com/userscripts/cash-log-endless
-// @version      1.5.0
+// @version      1.6.0
 // @author       TheWalkingGlitch
 // @description  Endless, sortable cash log, sales log, and purchase log. Cash Log keeps its own controls. Trade logs follow the page Next link.
 // @match        *://*.simcountry.com/*
@@ -109,11 +109,50 @@
   }
   function pageMode() {
     var href = location.href;
-    if (/[?&]SN_METHOD=tsl\b/i.test(href) || /cgiw\?tsl\b/i.test(href)) return 'tsl';
-    if (/[?&]SN_METHOD=tbl\b/i.test(href) || /cgiw\?tbl\b/i.test(href)) return 'tbl';
+    if (/[?&]SN_METHOD=tsl\b/i.test(href) || /cgiw\?tsl\b/i.test(href) || /recent sales/i.test(document.title || '')) return 'tsl';
+    if (/[?&]SN_METHOD=tbl\b/i.test(href) || /cgiw\?tbl\b/i.test(href) || /recent purchases/i.test(document.title || '')) return 'tbl';
     return cashOpen() ? 'cash' : '';
   }
   function tradePage() { var m = pageMode(); return m === 'tsl' || m === 'tbl'; }
+  function financialIndexBlock() {
+    var links = document.querySelectorAll('a[title="Financial Index"], a.tip');
+    for (var i = 0; i < links.length; i++) {
+      if (!/financial index/i.test((links[i].textContent || '') + ' ' + (links[i].title || ''))) continue;
+      return links[i].closest('table') || links[i];
+    }
+    return null;
+  }
+  function hideSiblingsAfter(node) {
+    if (!node) return;
+    var sib = node.nextElementSibling;
+    while (sib) {
+      var next = sib.nextElementSibling;
+      if (sib.id !== PANEL && !(sib.querySelector && sib.querySelector('#' + PANEL))) sib.style.display = 'none';
+      sib = next;
+    }
+  }
+  function hideNative() {
+    if (tradePage()) {
+      var heads = document.querySelectorAll('.paragrapheader, h1');
+      for (var i = 0; i < heads.length; i++) {
+        if (!/recent sales|recent purchases/i.test(heads[i].textContent || '')) continue;
+        hideSiblingsAfter(heads[i]);
+        hideSiblingsAfter(heads[i].closest('tr'));
+      }
+      return;
+    }
+    if (!cashOpen()) return;
+    var index = financialIndexBlock();
+    hideSiblingsAfter(index && index.closest('tr'));
+    var root = financeRoot();
+    if (!root) return;
+    var tables = root.querySelectorAll('table');
+    for (var t = 0; t < tables.length; t++) {
+      if (tables[t].closest('#' + PANEL)) continue;
+      if (index && (tables[t] === index || index.contains(tables[t]) || tables[t].contains(index))) continue;
+      tables[t].style.display = 'none';
+    }
+  }
   function titleWidth() {
     var title = document.getElementById('cdh_title0');
     var bar = title && title.closest ? title.closest('table') : document.querySelector('table.dt_titlebar');
@@ -122,6 +161,230 @@
     var w = node.getBoundingClientRect().width;
     if (w < 240 && node.parentNode) w = node.parentNode.getBoundingClientRect().width;
     return w > 240 ? Math.floor(w) : null;
+  }
+
+  function parseAmount(raw) {
+    if (!raw) return null;
+    var s = String(raw).replace(/SC\$/ig, '').trim();
+    if (!/\d/.test(s)) return null;
+    var neg = /^-|^\(|−/.test(s);
+    var m = s.replace(/[(),]/g, '').match(/([+-]?\d+(?:\.\d+)?)\s*([KMBT])?/i);
+    if (!m) return null;
+    var n = parseFloat(m[1]);
+    if (!isFinite(n)) return null;
+    var suf = (m[2] || '').toUpperCase();
+    n *= suf === 'T' ? 1e12 : suf === 'B' ? 1e9 : suf === 'M' ? 1e6 : suf === 'K' ? 1e3 : 1;
+    if (neg && n > 0) n = -n;
+    return n;
+  }
+  function formatAmount(n) {
+    if (n == null || !isFinite(n)) return '';
+    var a = Math.abs(n), v = a, suf = '', sign = n < 0 ? '-' : '+';
+    if (a >= 1e12) { v = a / 1e12; suf = 'T'; }
+    else if (a >= 1e9) { v = a / 1e9; suf = 'B'; }
+    else if (a >= 1e6) { v = a / 1e6; suf = 'M'; }
+    else if (a >= 1e3) { v = a / 1e3; suf = 'K'; }
+    return sign + v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + suf + ' SC$';
+  }
+  function parseGameDate(raw) {
+    if (!raw) return null;
+    var s = String(raw).replace(/,/g, ' ');
+    var m = s.match(/\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\d{3,5})\b/);
+    if (m && MONTHS[m[1].toLowerCase()]) { var mo = MONTHS[m[1].toLowerCase()]; return { month: mo, day: +m[2], year: +m[3], label: MNAME[mo] + ' ' + m[3] }; }
+    m = s.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{3,5})\b/);
+    if (m && MONTHS[m[2].toLowerCase()]) { mo = MONTHS[m[2].toLowerCase()]; return { month: mo, day: +m[1], year: +m[3], label: MNAME[mo] + ' ' + m[3] }; }
+    m = s.match(/\b([A-Za-z]{3,9})\.?\s+(\d{3,5})\b/);
+    if (m && MONTHS[m[1].toLowerCase()]) { mo = MONTHS[m[1].toLowerCase()]; return { month: mo, day: 0, year: +m[2], label: MNAME[mo] + ' ' + m[2] }; }
+    return null;
+  }
+  function dateValue(d) { return d ? d.year * 10000 + d.month * 100 + (d.day || 0) : 0; }
+
+  function docFrom(html) {
+    var s = String(html || '');
+    var idx = s.indexOf(':JXtitle>');
+    if (s.indexOf('<!JXtitle:') === 0 && idx !== -1) s = s.slice(idx + 9);
+    var doc = document.implementation.createHTMLDocument('c');
+    doc.documentElement.innerHTML = s;
+    return doc;
+  }
+
+  function innermostTables(root) {
+    var all = root.querySelectorAll('table');
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].querySelector('table')) continue;
+      if (all[i].closest && all[i].closest('#' + PANEL)) continue;
+      out.push(all[i]);
+    }
+    return out;
+  }
+
+  function parseTable(table) {
+    var trs = Array.prototype.slice.call(table.querySelectorAll('tr'));
+    var headerIdx = -1, headerTexts = [];
+    for (var i = 0; i < trs.length; i++) {
+      if (trs[i].querySelector('.datacolheader, th.datacolheader')) {
+        headerIdx = i;
+        headerTexts = Array.prototype.map.call(trs[i].querySelectorAll('th, td'), textOf);
+        break;
+      }
+    }
+    var body = [], carry = null;
+    for (var r = headerIdx + 1; r < trs.length; r++) {
+      var cells = Array.prototype.slice.call(trs[r].querySelectorAll('th, td'));
+      var texts = cells.map(textOf);
+      if (texts.every(blank)) continue;
+      var bits = texts.filter(function (t) { return !blank(t); });
+      var joined = bits.join(' ');
+      var asDate = parseGameDate(joined);
+      if (asDate && bits.length === 1 && parseAmount(joined) == null) { carry = asDate; continue; }
+      body.push({ texts: texts, carry: carry, cells: cells });
+    }
+    var width = headerTexts.length;
+    body.forEach(function (row) { if (row.texts.length > width) width = row.texts.length; });
+    var keep = [];
+    for (var c = 0; c < width; c++) {
+      var filled = 0;
+      body.forEach(function (row) { if (!blank(row.texts[c])) filled++; });
+      var head = headerTexts[c] || '';
+      var icon = false;
+      if (body[0] && body[0].cells[c] && body[0].cells[c].querySelector) {
+        var img = body[0].cells[c].querySelector('img');
+        icon = !!(img && blank(head) && filled === 0);
+      }
+      if (icon) continue;
+      if (!blank(head) || filled > 0) keep.push(c);
+    }
+    if (!keep.length) return null;
+    var headers = keep.map(function (idx) {
+      var h = headerTexts[idx] || '';
+      return blank(h) ? '' : h;
+    });
+    headers = headers.map(function (h, n) {
+      if (!blank(h)) return h;
+      var sample = '';
+      for (var i = 0; i < body.length && i < 8; i++) sample += ' ' + (body[i].texts[keep[n]] || '');
+      if (parseGameDate(sample)) return 'Date';
+      if (parseAmount(sample) != null) return 'Amount';
+      return 'Detail';
+    });
+    var rows = [], used = {};
+    body.forEach(function (row) {
+      var texts = keep.map(function (idx) { return row.texts[idx] || ''; });
+      if (texts.every(blank)) return;
+      var dateHit = null, amountHit = null;
+      texts.forEach(function (t, i) {
+        var d = parseGameDate(t);
+        if (d && !dateHit) dateHit = d;
+        var cell = row.cells[keep[i]];
+        var font = cell && cell.querySelector ? cell.querySelector('font') : null;
+        var color = ((cell && cell.getAttribute && cell.getAttribute('color')) || '') + ' ' + (font ? font.getAttribute('color') || '' : '');
+        var amt = parseAmount(t);
+        if (amt == null) return;
+        var head = (headers[i] || '').toLowerCase();
+        if (/balance|total cash|cash position|quantity|quality/.test(head)) return;
+        if (/red/i.test(color) && amt > 0) amt = -amt;
+        if (/price received|price paid|received|paid|change|amount/.test(head)) amountHit = amt;
+        else if (amountHit == null && /price/.test(head)) amountHit = amt;
+      });
+      var date = dateHit || row.carry;
+      var base = texts.join('|').toLowerCase();
+      var n = 1, key = base;
+      while (used[key]) { n++; key = base + '#' + n; }
+      used[key] = 1;
+      rows.push({
+        texts: texts, date: date,
+        month: date ? { month: date.month, year: date.year, label: date.label } : null,
+        amount: amountHit, key: key
+      });
+    });
+    if (!rows.length) return null;
+    var kinds = headers.map(function (h, col) {
+      var hl = h.toLowerCase();
+      if (/date|month|when|time/.test(hl)) return 'date';
+      if (/amount|change|cash|income|cost|paid|balance|sum|price|quantity|quality/.test(hl)) return 'num';
+      var dates = 0, nums = 0;
+      rows.slice(0, 10).forEach(function (row) {
+        if (parseGameDate(row.texts[col])) dates++;
+        if (parseAmount(row.texts[col]) != null) nums++;
+      });
+      if (dates >= 2) return 'date';
+      if (nums >= 2) return 'num';
+      return 'text';
+    });
+    return { headers: headers, kinds: kinds, rows: rows, score: rows.length + (headers.join(' ').match(/cash|amount|date/i) ? 10 : 0) };
+  }
+
+  function parseRoot(root) {
+    var tables = innermostTables(root);
+    var best = null;
+    tables.forEach(function (table) {
+      var cap = '';
+      var wrap = table.parentNode && table.parentNode.closest ? table.parentNode.closest('table') : null;
+      if (wrap) cap = textOf(wrap.querySelector('caption'));
+      if (/profit\s*&\s*loss|expected full year|year to date|cash ytd/i.test(cap)) return;
+      var parsed = parseTable(table);
+      if (!parsed) return;
+      var named = /cash log|recent cash|recent sales|recent purchases/i.test(cap + ' ' + (root && root.ownerDocument && root.ownerDocument.title || ''));
+      if (named && /when|date/.test(parsed.headers.join(' ').toLowerCase())) parsed.score += 100;
+      else if (!/when|date/.test(parsed.headers.join(' ').toLowerCase()) || parsed.kinds.indexOf('num') === -1) return;
+      if (!best || parsed.score > best.score) best = parsed;
+    });
+    return best;
+  }
+
+  function merge(parsed) {
+    if (!parsed) return 0;
+    if (parsed.headers.length >= state.headers.length) { state.headers = parsed.headers; state.kinds = parsed.kinds; }
+    var added = 0;
+      parsed.rows.forEach(function (row) {
+      if (!row.key || state.seen[row.key]) return;
+      if (pageMode() === 'tbl' && row.amount > 0) row.amount = -row.amount;
+      if (pageMode() === 'tsl' && row.amount < 0) row.amount = -row.amount;
+      state.seen[row.key] = 1;
+      state.rows.push(row);
+      added++;
+    });
+    return added;
+  }
+
+  function capHit() {
+    return !!(state.capOn && state.capN > 0 && state.rows.length >= state.capN);
+  }
+  function csvCell(s) {
+    s = String(s == null ? '' : s);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function fileSlug(s) {
+    return String(s || '').replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, '-').replace(/[^A-Za-z0-9._-]+/g, '').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+  }
+  function exportCsv() {
+    var rows = state.shown || [];
+    var head = state.headers.concat(['Month', 'Signed amount']);
+    var lines = [head.map(csvCell).join(',')];
+    var first = '', last = '';
+    rows.forEach(function (row) {
+      var cells = row.texts.slice();
+      cells.push(row.month ? row.month.label : '');
+      cells.push(row.amount == null ? '' : String(row.amount));
+      lines.push(cells.map(csvCell).join(','));
+      var label = row.date ? row.date.label + (row.date.day ? '-' + row.date.day : '') : (row.month ? row.month.label : '');
+      if (label && !first) first = label;
+      if (label) last = label;
+    });
+    var country = fileSlug((document.getElementById('cdh_title0') || {}).textContent) || 'country';
+    var flow = state.flow === 'in' ? 'income' : state.flow === 'out' ? 'spending' : 'all';
+    var month = state.month === 'all' ? 'all-months' : fileSlug(state.month);
+    var range = first && last ? fileSlug(first) + '_to_' + fileSlug(last) : 'no-dates';
+    var name = [(tradePage() ? pageMode() + '-log' : 'cash-log'), country, flow, month, range, rows.length + 'rows'].filter(Boolean).join('_') + '.csv';
+    var blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
   }
   function tradeNextFrom(doc) {
     var method = pageMode();
@@ -147,4 +410,392 @@
     }
     return '';
   }
+  function countryQuery() {
+    var a = document.querySelector('a[onclick*="miDesktopTab=6"]');
+    var m = a && (a.getAttribute('onclick') || '').match(/miCountryName=([^&']+)/);
+    var id = window.dtDesktopOwnerID || window.ckLoginCountry || '';
+    var q = 'miAppletID=cfinance&miDesktopTab=6';
+    if (m) q += '&miCountryName=' + m[1];
+    if (id) q += '&miDesktopOwnerKind=' + (window.dtDesktopOwnerKind || 'c') + '&miDesktopOwnerID=' + id;
+    return q;
+  }
+  function absUrl(raw) {
+    if (!raw) return '';
+    if (/^https?:/i.test(raw)) return raw;
+    if (raw.charAt(0) === '/') return location.origin + raw;
+    if (/^cgi2nova/i.test(raw)) return location.origin + '/cgi-bin/' + raw;
+    return location.origin + '/cgi-bin/cgiw?' + raw.replace(/^\?/, '');
+  }
+  function discoverNext(html) {
+    var doc = docFrom(html);
+    var nodes = doc.querySelectorAll('a, form, input');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var blob = ((n.getAttribute && (n.getAttribute('href') || '')) || '') + ' ' + ((n.getAttribute && n.getAttribute('onclick')) || '') + ' ' + (n.name || '') + ' ' + (n.value || '');
+      if (/miTradeTransaction/.test(blob)) continue;
+      var m = blob.match(/deskmenu_smartexec\('([^']*miDesktopTab=6[^']*)'\)/) || blob.match(/jxGetDesktopApplet[^'")\s]*miDesktopTab=6[^'")\s]*/);
+      if (m && /miFrom|miTo|miPageStartPos|miPageSize|plNextPage/.test(blob)) return absUrl(m[1] || m[0]);
+      if (n.href && /miDesktopTab=6/.test(n.href) && /miFrom|miPageStartPos/.test(n.href)) return n.href;
+    }
+    var ids = [];
+    var re = /miTradeTransaction=(\d+)/g, mm;
+    while ((mm = re.exec(html))) ids.push(mm[1]);
+    if (!ids.length) return '';
+    ids.sort();
+    var base = lastReq || (location.origin + '/cgi-bin/cgiw?jxGetDesktopApplet&' + countryQuery());
+    base = base.replace(/[&?]miTradeTransaction=\d+/, '');
+    return base + (base.indexOf('?') === -1 ? '?' : '&') + 'miTradeTransaction=' + ids[0];
+  }
+
+  function visible() {
+    var q = state.filter.trim().toLowerCase();
+    return state.rows.filter(function (row) {
+      if (state.month !== 'all' && (!row.month || row.month.label !== state.month)) return false;
+      if (state.flow === 'in' && !(row.amount > 0)) return false;
+      if (state.flow === 'out' && !(row.amount < 0)) return false;
+      if (q && row.texts.join(' ').toLowerCase().indexOf(q) === -1) return false;
+      return true;
+    });
+  }
+  function compare(a, b) {
+    if (state.sortCol < 0) return 0;
+    var kind = state.kinds[state.sortCol] || 'text';
+    var av, bv, col = state.sortCol;
+    if (kind === 'num') { av = parseAmount(a.texts[col]); if (av == null) av = a.amount || 0; bv = parseAmount(b.texts[col]); if (bv == null) bv = b.amount || 0; }
+    else if (kind === 'date') { av = dateValue(parseGameDate(a.texts[col]) || a.date); bv = dateValue(parseGameDate(b.texts[col]) || b.date); }
+    else { av = (a.texts[col] || '').toLowerCase(); bv = (b.texts[col] || '').toLowerCase(); }
+    if (av < bv) return -state.sortDir;
+    if (av > bv) return state.sortDir;
+    return 0;
+  }
+  function totals(rows) {
+    var inc = 0, out = 0;
+    rows.forEach(function (row) { if (row.amount == null) return; if (row.amount >= 0) inc += row.amount; else out += row.amount; });
+    return { inc: inc, out: out, net: inc + out };
+  }
+  function ordered() { var rows = visible(); return state.sortCol < 0 ? rows : rows.slice().sort(compare); }
+
+  function displayItems(rows) {
+    if (!state.breaks) return rows.map(function (row) { return { type: 'row', row: row }; });
+    var items = [], last = '\u0000', group = [];
+    function flush() {
+      if (!group.length) return;
+      var label = group[0].month ? group[0].month.label : 'Undated';
+      var g = totals(group);
+      items.push({ type: 'month', label: label, n: group.length, inc: g.inc, out: g.out, net: g.net });
+      group.forEach(function (row) { items.push({ type: 'row', row: row }); });
+      group = [];
+    }
+    rows.forEach(function (row) {
+      var label = row.month ? row.month.label : 'Undated';
+      if (label !== last) { flush(); last = label; }
+      group.push(row);
+    });
+    flush();
+    return items;
+  }
+  function rowHtml(row) {
+    var html = '<tr class="row ' + (row.amount > 0 ? 'inc' : row.amount < 0 ? 'out' : '') + '">';
+    for (var c = 0; c < state.headers.length; c++) {
+      var plain = row.texts[c] || '';
+      html += '<td class="' + (state.kinds[c] === 'num' ? 'num' : '') + '" data-full="' + esc(plain) + '">' + esc(plain) + '</td>';
+    }
+    return html + '</tr>';
+  }
+  function paintStatus() {
+    var panel = document.getElementById(PANEL);
+    if (!panel) return;
+    var rows = ordered();
+    var tot = totals(state.shown || []);
+    var st = panel.querySelector('.stat');
+    if (!st) return;
+    st.textContent = (state.shown ? state.shown.length : 0) + ' on page / ' + rows.length + ' matching / ' + state.rows.length + ' loaded' + (state.capOn ? ' · cap ' + state.capN : '') + ' · net ' + formatAmount(tot.net || 0) + (state.loading ? ' · loading older…' : '') + (capHit() ? ' · stopped at cap' : '') + (state.exhausted ? ' · no further page' : '') + (state.status ? ' · ' + state.status : '');
+  }
+  function extendPage(all) {
+    var panel = document.getElementById(PANEL);
+    var body = panel && panel.querySelector('tbody');
+    if (!body || !state.items) return;
+    if (state.cursor >= state.items.length) return;
+    var end = all ? state.items.length : Math.min(state.items.length, state.cursor + 40);
+    var html = '';
+    for (var i = state.cursor; i < end; i++) {
+      var item = state.items[i];
+      if (item.type === 'month') {
+        html += '<tr class="month"><td colspan="' + Math.max(1, state.headers.length) + '">' + esc(item.label) + ' · ' + item.n + ' · in ' + formatAmount(item.inc) + ' · out ' + formatAmount(item.out) + ' · net ' + formatAmount(item.net) + '</td></tr>';
+      } else {
+        html += rowHtml(item.row);
+        state.shown.push(item.row);
+      }
+    }
+    state.cursor = end;
+    body.insertAdjacentHTML('beforeend', html);
+    paintStatus();
+  }
+  function hideTip() { clearTimeout(tipTimer); if (tipEl) tipEl.style.display = 'none'; }
+  function armTip(ev) {
+    hideTip();
+    var cell = ev.target.closest && ev.target.closest('td');
+    if (!cell || !cell.closest('#' + PANEL) || /month/.test(cell.parentNode.className || '')) return;
+    var full = cell.getAttribute('data-full') || '';
+    if (!full) return;
+    var x = ev.clientX, y = ev.clientY;
+    tipTimer = setTimeout(function () {
+      tipEl.textContent = full;
+      tipEl.style.display = 'block';
+      tipEl.style.left = Math.max(8, Math.min(x + 14, window.innerWidth - tipEl.offsetWidth - 12)) + 'px';
+      var top = y + 16;
+      if (top + tipEl.offsetHeight > window.innerHeight - 8) top = y - tipEl.offsetHeight - 10;
+      tipEl.style.top = Math.max(8, top) + 'px';
+    }, 1000);
+  }
+
+  function render(force) {
+    var panel = document.getElementById(PANEL);
+    if (!panel) return;
+    var w = titleWidth();
+    if (w) { panel.style.width = w + 'px'; panel.style.maxWidth = '100%'; }
+    var rows = ordered();
+    var viewSig = [state.sortCol, state.sortDir, state.filter, state.flow, state.month, state.breaks, state.headers.join('|')].join('~');
+    var frame = panel.querySelector('.frame');
+    if (!force && viewSig === state.viewSig && frame && frame.querySelector('tbody')) {
+      state.items = displayItems(rows);
+      extendPage(true);
+      return;
+    }
+    state.viewSig = viewSig;
+    state.items = displayItems(rows);
+    state.shown = [];
+    state.cursor = 0;
+    var months = {};
+    state.rows.forEach(function (row) { if (row.month) months[row.month.label] = dateValue(row.month); });
+    var sel = panel.querySelector('[data-role="month"]');
+    var monthHtml = '<option value="all">All game months</option>' + Object.keys(months).sort(function (a, b) { return months[b] - months[a]; }).map(function (m) {
+      return '<option value="' + esc(m) + '"' + (m === state.month ? ' selected' : '') + '>' + esc(m) + '</option>';
+    }).join('');
+    if (sel && sel.innerHTML !== monthHtml) sel.innerHTML = monthHtml;
+    var head = '<tr>' + state.headers.map(function (h, i) {
+      var kind = state.kinds[i] || 'text';
+      var width = kind === 'date' ? '16%' : kind === 'num' ? '14%' : '';
+      return '<th class="' + (kind === 'num' ? 'num' : '') + '" data-col="' + i + '"' + (width ? ' style="width:' + width + '"' : '') + '>' + esc(h) + (state.sortCol === i ? (state.sortDir > 0 ? ' ▲' : ' ▼') : '') + '</th>';
+    }).join('') + '</tr>';
+    frame.innerHTML = '<table><thead>' + head + '</thead><tbody></tbody></table>';
+    extendPage(true);
+  }
+
+  function loadOlder() {
+    if (capHit()) {
+      state.status = 'stopped at cap ' + state.capN;
+      paintStatus();
+      return;
+    }
+    if (state.loading || state.exhausted || !nextUrl) {
+      if (!nextUrl) state.status = 'no older-page link in the cash log response';
+      paintStatus();
+      return;
+    }
+    state.loading = true;
+    var url = nextUrl;
+    paintStatus();
+    fetch(url, { method: tradePage() ? 'GET' : 'POST', credentials: 'include' }).then(function (r) { return r.text(); }).then(function (html) {
+      if (tradePage()) {
+        var doc = docFrom(html);
+        var added = merge(parseRoot(doc.body));
+        var nxt = tradeNextFrom(doc);
+        if (!added || !nxt || nxt === url) {
+          state.exhausted = true;
+          state.status = added ? '' : 'server returned no further trade rows';
+        } else {
+          nextUrl = nxt;
+          state.status = state.rows.length + ' rows';
+        }
+        return;
+      }
+      if (!/cash log|recent cash|miDesktopTab=6|when/i.test(html)) {
+        state.exhausted = true;
+        state.status = 'older request was not another cash-log window';
+        return;
+      }
+      var added = merge(parseRoot(docFrom(html).body));
+      var nxt = discoverNext(html);
+      if (!added || nxt === url) {
+        state.exhausted = true;
+        state.status = added ? '' : 'server returned no further cash-log rows';
+      } else {
+        nextUrl = nxt;
+        state.status = state.rows.length + ' rows';
+      }
+    }).catch(function () {
+      state.exhausted = true;
+      state.status = 'older page failed';
+    }).then(function () {
+      state.loading = false;
+      render();
+      if (!state.exhausted && nextUrl && !capHit()) loadOlder();
+    });
+  }
+
+  function ensurePanel(anchor) {
+    addStyle();
+    var panel = document.getElementById(PANEL);
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = PANEL;
+      panel.innerHTML = tradePage()
+        ? '<div class="cap">' + (pageMode() === 'tsl' ? 'Sales log' : 'Purchase log') + ' — loaded history</div><div class="tools"><label>Filter <input type="search" data-role="filter" placeholder="any column"></label><label>Month <select data-role="month"><option value="all">All game months</option></select></label><label><input type="checkbox" data-role="breaks" checked> Month breaks</label><label><input type="checkbox" data-role="cap" checked> Cap rows <input type="number" data-role="capn" min="1" step="1" value="1000" style="width:5em"></label><button type="button" data-role="older">Load older</button><button type="button" data-role="csv">Export CSV</button><button type="button" data-role="reset">Reset sort</button></div><div class="stat"></div><div class="frame"></div>'
+        : '<div class="cap">Cash log — loaded history</div><div class="tools"><label>Filter <input type="search" data-role="filter" placeholder="any column"></label><label>Flow <select data-role="flow"><option value="all">All</option><option value="in">Income</option><option value="out">Spending</option></select></label><label>Month <select data-role="month"><option value="all">All game months</option></select></label><label><input type="checkbox" data-role="breaks" checked> Month breaks</label><label><input type="checkbox" data-role="cap" checked> Cap rows <input type="number" data-role="capn" min="1" step="1" value="1000" style="width:5em"></label><button type="button" data-role="older">Load older</button><button type="button" data-role="csv">Export CSV</button><button type="button" data-role="reset">Reset sort</button></div><div class="stat"></div><div class="frame"></div>';
+      panel.addEventListener('click', function (ev) {
+        var th = ev.target.closest && ev.target.closest('th[data-col]');
+        if (!th) return;
+        ev.preventDefault(); ev.stopPropagation();
+        var col = parseInt(th.getAttribute('data-col'), 10);
+        if (state.sortCol === col) state.sortDir = -state.sortDir;
+        else { state.sortCol = col; state.sortDir = state.kinds[col] === 'text' ? 1 : -1; }
+        render(true);
+      });
+      panel.addEventListener('mouseover', armTip);
+      panel.addEventListener('mouseout', function (ev) { if (!(ev.relatedTarget && panel.contains(ev.relatedTarget))) hideTip(); });
+      panel.querySelector('[data-role="filter"]').addEventListener('input', function (ev) { state.filter = ev.target.value; render(true); });
+      var flow = panel.querySelector('[data-role="flow"]');
+      if (flow) flow.addEventListener('change', function (ev) { state.flow = ev.target.value; render(true); });
+      panel.querySelector('[data-role="month"]').addEventListener('change', function (ev) { state.month = ev.target.value; render(true); });
+      panel.querySelector('[data-role="breaks"]').addEventListener('change', function (ev) { state.breaks = ev.target.checked; render(true); });
+      panel.querySelector('[data-role="older"]').addEventListener('click', function () {
+        state.exhausted = false;
+        loadOlder();
+      });
+      panel.querySelector('[data-role="csv"]').addEventListener('click', exportCsv);
+      panel.querySelector('[data-role="cap"]').addEventListener('change', function (ev) {
+        state.capOn = ev.target.checked;
+        render();
+      });
+      panel.querySelector('[data-role="capn"]').addEventListener('change', function (ev) {
+        var n = parseInt(ev.target.value, 10);
+        state.capN = n > 0 ? n : 1000;
+        render();
+      });
+      panel.querySelector('[data-role="reset"]').addEventListener('click', function () {
+        state.sortCol = -1; state.filter = ''; state.flow = 'all'; state.month = 'all';
+        panel.querySelector('[data-role="filter"]').value = '';
+        if (panel.querySelector('[data-role="flow"]')) panel.querySelector('[data-role="flow"]').value = 'all';
+        render(true);
+      });
+    }
+    panel.style.display = '';
+    hideNative();
+    if (tradePage()) {
+      var heads = document.querySelectorAll('.paragrapheader, h1');
+      var spot = null;
+      for (var i = 0; i < heads.length; i++) {
+        if (/recent sales|recent purchases/i.test(heads[i].textContent || '')) { spot = heads[i]; break; }
+      }
+      if (spot && spot.parentNode && panel.previousSibling !== spot) {
+        if (spot.nextSibling) spot.parentNode.insertBefore(panel, spot.nextSibling);
+        else spot.parentNode.appendChild(panel);
+      } else if (!panel.parentNode) document.body.appendChild(panel);
+      return panel;
+    }
+    if (cashOpen()) {
+      var index = financialIndexBlock();
+      var row = index && index.closest('tr');
+      if (row && row.parentNode) {
+        var holder = document.getElementById(PANEL + '-row');
+        if (!holder) {
+          holder = document.createElement('tr');
+          holder.id = PANEL + '-row';
+          var cell = document.createElement('td');
+          cell.colSpan = 3;
+          holder.appendChild(cell);
+          row.parentNode.insertBefore(holder, row.nextSibling);
+        }
+        if (panel.parentNode !== holder.firstChild) holder.firstChild.appendChild(panel);
+        return panel;
+      }
+    }
+    var host = anchor && anchor.parentNode ? anchor.parentNode : financeRoot();
+    if (host && panel.parentNode !== host) host.appendChild(panel);
+    else if (!panel.parentNode) document.body.appendChild(panel);
+    return panel;
+  }
+
+  function scan() {
+    try {
+      if (tradePage()) {
+        ensurePanel(document.body);
+        var parsedTrade = parseRoot(document.body);
+        if (!parsedTrade || !parsedTrade.rows.length) {
+          state.status = 'trade page had no rows';
+          render();
+          return;
+        }
+        var tradeSig = parsedTrade.rows.slice(0, 2).map(function (r) { return r.key; }).join('~') + '|' + parsedTrade.rows.length;
+        if (tradeSig === state.sig && state.rows.length) return;
+        state.sig = tradeSig;
+        state.rows = []; state.seen = {}; state.headers = [];
+        merge(parsedTrade);
+        nextUrl = tradeNextFrom(document);
+        state.exhausted = !nextUrl;
+        state.status = nextUrl ? '' : 'no Next link on this trade page';
+        render(true);
+        if (nextUrl && !capHit()) loadOlder();
+        return;
+      }
+      if (!cashOpen()) {
+        var gone = document.getElementById(PANEL);
+        if (gone) gone.style.display = 'none';
+        return;
+      }
+      var root = financeRoot();
+      ensurePanel(root);
+      var parsed = null;
+      if (lastHtml && /miDesktopTab=6|cash log|recent cash/i.test(lastHtml)) parsed = parseRoot(docFrom(lastHtml).body);
+      if (!parsed && root) parsed = parseRoot(root);
+      if (!parsed || !parsed.rows.length) {
+        state.status = lastHtml ? 'payload had no rows' : 'waiting for the cash log payload';
+        render();
+        return;
+      }
+      var sig = parsed.rows.slice(0, 2).map(function (r) { return r.key; }).join('~') + '|' + parsed.rows.length;
+      if (sig === state.sig && state.rows.length) return;
+      state.sig = sig;
+      state.rows = []; state.seen = {}; state.headers = [];
+      merge(parsed);
+      nextUrl = discoverNext(lastHtml || '');
+      state.exhausted = !nextUrl;
+      state.status = nextUrl ? '' : 'no older-page link in the cash log response';
+      render(true);
+      if (nextUrl && !capHit()) loadOlder();
+    } catch (err) {
+      ensurePanel(null);
+      state.status = err && err.message ? err.message : String(err);
+      var st = document.querySelector('#' + PANEL + ' .stat');
+      if (st) st.textContent = state.status;
+    }
+  }
+
+  var timer = null;
+  function schedule() { clearTimeout(timer); timer = setTimeout(scan, 200); }
+  if (!window.__scclXhr) {
+    window.__scclXhr = true;
+    var open = XMLHttpRequest.prototype.open, send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, url) { this.__scclUrl = String(url || ''); return open.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function () {
+      this.addEventListener('load', function () {
+        var url = this.__scclUrl || '';
+        if (/jxGetDesktopApplet/i.test(url) && /miDesktopTab=6/.test(url)) {
+          lastReq = url;
+          lastHtml = this.responseText || '';
+        }
+        if (/cfinance|jxGetDesktopApplet/i.test(url)) schedule();
+      });
+      return send.apply(this, arguments);
+    };
+  }
+  schedule();
+  new MutationObserver(function (muts) {
+    for (var i = 0; i < muts.length; i++) {
+      var n = muts[i].target;
+      if (n && n.closest && (n.closest('#' + PANEL) || n.id === 'sccl-tip')) return;
+    }
+    schedule();
+  }).observe(document.documentElement, { childList: true, subtree: true });
 })();
