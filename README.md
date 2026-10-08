@@ -10,11 +10,11 @@ This repo is a small toolkit for people who already play. It does not replace th
 
 | Script | Version | What it does |
 | --- | --- | --- |
-| [Loan Offers.js](Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
-| [Order Strategies](Order%20Strategies) | 1.4.0 | Select, filter, preset, and snapshot stock-order strategies |
-| [Salary Tweaks](Salary%20Tweaks) | 1.1.0 | Select, filter, and bulk-set state corporation salaries |
-| [Portal.js](Portal.js) | 1.3.0 | Reorder countries/enterprises and flick the news ticker |
-| [Simcountry Cash Log — endless, sort, filter](Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) | 1.4.6 | Sort, filter, cap, and export the Cash Log without spacer columns |
+| [Loan Offers.js](scripts/Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
+| [Order Strategies](scripts/Order%20Strategies) | 1.4.0 | Select, filter, preset, and snapshot stock-order strategies |
+| [Salary Tweaks](scripts/Salary%20Tweaks) | 1.1.0 | Select, filter, and bulk-set state corporation salaries |
+| [Portal.js](scripts/Portal.js) | 1.3.0 | Reorder countries/enterprises and flick the news ticker |
+| [Simcountry Cash Log — endless, sort, filter](scripts/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) | 1.4.6 | Sort, filter, cap, and export the Cash Log without spacer columns |
 | [War Casualty Bookmarklet](3rd%20Party/War%20Casualty%20Bookmarklet.txt) | 3rd party | Summarize war losses from a battle report page |
 
 > Unofficial. Not affiliated with Simcountry or its operators. Use at your own risk, and stay inside the game's rules.
@@ -30,11 +30,11 @@ This repo is a small toolkit for people who already play. It does not replace th
 
 Raw files:
 
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/Loan%20Offers.js`
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/Order%20Strategies`
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/Salary%20Tweaks`
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/Portal.js`
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Loan%20Offers.js`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Order%20Strategies`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Salary%20Tweaks`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Portal.js`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter`
 
 Preferences are stored in Tampermonkey / `localStorage`. They stay on your machine.
 
@@ -42,13 +42,14 @@ Preferences are stored in Tampermonkey / `localStorage`. They stay on your machi
 
 ## Loan Offers Toolkit
 
-**File:** [`Loan Offers.js`](Loan%20Offers.js)  
+**File:** [`Loan Offers.js`](scripts/Loan%20Offers.js)  
 **Author:** TheWalkingGlitch  
 **Runs on:** country and enterprise loan-offer pages (`loanmyoff`, `eloanmyoff`, `cloanmyoff`, and close cousins)
 
 The stock loan page is a form plus a flat list. This script keeps the native submit path and layers a small toolkit on top of it.
 
-![Overhauled loan offers page with sorting, highlighting, and repeat submit](readmescreenshots/LoanOffersjs%20Example%20Screenshot.png)
+![Loan Offers toolkit on the loan-offer page](readmescreenshots/LoanOffersjs%20Example%20Screenshot.png)
+*Loan Offers toolkit on the loan-offer page.*
 
 ### Features
 
@@ -68,11 +69,13 @@ Interest rates stay world-controlled. The script only fills amount, period, and 
 
 ## Order Strategy Toolbox
 
-**File:** [`Order Strategies`](Order%20Strategies) *(no `.js` extension; Tampermonkey still accepts it)*  
+**File:** [`Order Strategies`](scripts/Order%20Strategies) *(no `.js` extension; Tampermonkey still accepts it)*  
 **Author:** TheWalkingGlitch  
 **Runs on:** Country → Trade → **Order Strategies** (`form name="fSOS"`)
 
 Stock order strategies are a long grid of products. The toolbox is a floating panel on that page. Selection is a checkbox to the left of each industry icon — sorting the list does not change what is checked.
+
+Screenshot: none yet.
 
 ### Features
 
@@ -97,14 +100,15 @@ Nothing is sent until you hit the site's own save button.
 
 ## State Salary Toolbox
 
-**File:** [`Salary Tweaks`](Salary%20Tweaks) *(no `.js` extension; Tampermonkey still accepts it)*  
+**File:** [`Salary Tweaks`](scripts/Salary%20Tweaks) *(no `.js` extension; Tampermonkey still accepts it)*  
 **Userscript name:** Simcountry State Salary Toolbox  
 **Author:** TheWalkingGlitch  
 **Runs on:** Country → Corporations → **Salary Levels** (`statecmpsalaries` / `stateCmpSalariesSubmit`)
 
 Same idea as the order-strategy toolbox, pointed at the state salary grid. Checkboxes select corporations. Sorting and filters only reflow the live list. Apply writes the form fields; the site button **Set Salary Changes** is what actually saves.
 
-![Salary Toolbox floating panel with sort, filters, bulk apply, and named revisions](Salary%20Toolbox%20SS.png)
+![Salary Tweaks toolbox on the salary-levels page](readmescreenshots/Salary%20Toolbox%20SS.png)
+*Salary Tweaks toolbox on the salary-levels page.*
 
 ### Features
 
@@ -128,14 +132,15 @@ Nothing is sent until you hit **Set Salary Changes**.
 
 ## Desktop Enhancer (Portal.js)
 
-**File:** [`Portal.js`](Portal.js)  
+**File:** [`Portal.js`](scripts/Portal.js)  
 **Userscript name:** Simcountry Desktop Enhancer  
 **Author:** TheWalkingGlitch  
 **Runs on:** the portal widgets *My Countries* / *My Enterprises*, and any page that still has the scrolling news ticker
 
 Drag the country and enterprise tiles into the order you actually use, or pick a named sort. The ticker can be grabbed and flung instead of only auto-scrolling.
 
-![Custom sort order UI on the main portal page](readmescreenshots/Portaljs%20Example%20Screenshot.png)
+![Portal desktop enhancer on the portal page](readmescreenshots/Portaljs%20Example%20Screenshot.png)
+*Portal desktop enhancer on the portal page.*
 
 ### Widget features
 
@@ -163,12 +168,15 @@ Order and ticker prefs live in `localStorage` under `scEnhancer.v1`. From the co
 
 ## Cash Log (endless, sort, filter)
 
-**File:** [`Simcountry Cash Log — endless, sort, filter`](Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) *(no `.js` extension; Tampermonkey still accepts it)*  
+**File:** [`Simcountry Cash Log — endless, sort, filter`](scripts/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) *(no `.js` extension; Tampermonkey still accepts it)*  
 **Userscript name:** Simcountry Cash Log — endless, sort, filter  
 **Author:** TheWalkingGlitch  
 **Runs on:** Country Finance → **Cash Log** (`miDesktopTab=6`, applet `cfinance`). The address bar stays put; the tab writes the applet into the desktop.
 
 Cash Log is not its own page. The script reads that applet payload, drops empty spacer and history-icon columns, and paints a second table of the text columns.
+
+![Cash Log toolkit on the cash-log page](readmescreenshots/SS%20Cash%20Log.png)
+*Cash Log toolkit on the cash-log page.*
 
 ### Features
 
@@ -194,6 +202,8 @@ The older-page fetch goes to the game, and only when that link is in the cash-lo
 
 A bookmarklet, not a Tampermonkey script. It reads the attacker / defender report blocks on a war page, totals equipment losses plus soldiers killed and wounded, and opens a compact comparison table in a new window.
 
+Screenshot: none yet.
+
 ### Install
 
 1. Open the text file and copy the single `javascript:...` line.
@@ -206,19 +216,22 @@ A bookmarklet, not a Tampermonkey script. It reads the attacker / defender repor
 
 ```
 Simcountry/
-├── Loan Offers.js
-├── Order Strategies
-├── Salary Tweaks
-├── Portal.js
-├── Simcountry Cash Log — endless, sort, filter
-├── Salary Toolbox SS.png
-├── LICENSE
-├── README.md
+├── scripts/
+│   ├── Loan Offers.js
+│   ├── Order Strategies
+│   ├── Portal.js
+│   ├── Salary Tweaks
+│   └── Simcountry Cash Log — endless, sort, filter
 ├── readmescreenshots/
 │   ├── LoanOffersjs Example Screenshot.png
-│   └── Portaljs Example Screenshot.png
-└── 3rd Party/
-    └── War Casualty Bookmarklet.txt
+│   ├── Portaljs Example Screenshot.png
+│   ├── Salary Toolbox SS.png
+│   ├── SS Cash Log.png
+│   └── placeholder
+├── 3rd Party/
+│   └── War Casualty Bookmarklet.txt
+├── LICENSE
+└── README.md
 ```
 
 ---
@@ -227,6 +240,7 @@ Simcountry/
 
 - These scripts scrape and click the live site. A game update can break them overnight.
 - They are client-side only. They do not talk to a third-party server.
+- First-party userscripts now live under `scripts/`. Raw install URLs changed with that move. Existing Tampermonkey copies need the new raw link (or a reinstall from the file) if they were pointed at the old root path.
 - Batch loan submits reload the offer page once per offer, with a delay. Do not walk away from a 50-offer job if you care about the result.
 - Order-strategy and salary revisions live in userscript storage. Export nothing you cannot rebuild.
 - Portal sort order is local to that browser. It will not follow you to another machine.
