@@ -10,4 +10,141 @@
 // @grant        none
 // ==/UserScript==
 
-PLACEHOLDER_TOO_LARGE
+/*
+ * Cash Log is not a separate navigation. The tab calls
+ *   deskmenu_smartexec('cfinance&miCountryName=...&miDesktopTab=6')
+ * which POSTs /cgi-bin/cgiw?jxGetDesktopApplet&miAppletID=cfinance&miDesktopTab=6
+ * and writes the body into #da_cloned_contents. The address bar stays put.
+ *
+ * Finance tables repeat [value][spacer or 14px history icon]. Those spacers
+ * were the bogus columns. This version parses the applet response itself, not
+ * only table.data, and drops a column only when both its header and its cells
+ * are empty.
+ *
+ * The Firefox profile of this tab shows one fetch and no paging call:
+ *   deskmenu_smartexec -> deskmenu_applet -> dtLoadApplet -> jxRequestExec
+ *   -> XMLHttpRequest.open/send -> jxGotDesktopAppletXL
+ * which writes the body into #da_cloned_contents. Guessed miFrom / miPageStartPos
+ * requests are not part of that path; they were pulling other finance tables
+ * Trade sales (cgiw?tsl) and purchases (cgiw?tbl) are full pages. Next is not
+ * miFrom. The page posts or links cgi2nova with the last row cursor:
+ *   SN_ADDRESS=wwwCountry&SN_METHOD=tsl|tbl&miEntityKind=c&miEntityNumber=…
+ *   &miTradeTransaction=<last id>&next=Next <nbsp>>
+ * Only that next control is followed.
+ */
+(function () {
+  'use strict';
+
+  var PANEL = 'sc-cashlog-endless';
+  var MONTHS = { jan:1, january:1, feb:2, february:2, mar:3, march:3, apr:4, april:4, may:5, jun:6, june:6, jul:7, july:7, aug:8, august:8, sep:9, sept:9, september:9, oct:10, october:10, nov:11, november:11, dec:12, december:12 };
+  var MNAME = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var PAGE = 20;
+  var lastHtml = '';
+  var lastReq = '';
+  var nextUrl = '';
+
+  var state = {
+    rows: [], headers: [], kinds: [],
+    sortCol: -1, sortDir: -1,
+    filter: '', flow: 'all', month: 'all', breaks: true,
+    capOn: true, capN: 1000,
+    rendered: 120, loading: false, exhausted: false,
+    scheme: '', offset: 21, status: '', sig: '', seen: {}
+  };
+  var tipTimer = null, tipEl = null;
+
+  function addStyle() {
+    if (document.getElementById('sccl-style')) return;
+    var s = document.createElement('style');
+    s.id = 'sccl-style';
+    s.textContent = [
+      '#'+PANEL+'{box-sizing:border-box;margin:12px 0 18px;clear:both;font-family:arial,helvetica,sans-serif;color:#000;}',
+      '#'+PANEL+' *{box-sizing:border-box;}',
+      '#'+PANEL+' .cap{font-weight:bold;font-size:12pt;padding:0 0 .3em;}',
+      '#'+PANEL+' .tools{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 6px;font-size:10pt;}',
+      '#'+PANEL+' .tools label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}',
+      '#'+PANEL+' .tools input,#'+PANEL+' .tools select,#'+PANEL+' .tools button{font:inherit;padding:2px 6px;}',
+      '#'+PANEL+' .tools button{cursor:pointer;}',
+      '#'+PANEL+' .stat{font-size:9pt;margin:0 0 6px;color:#333;}',
+      '#'+PANEL+' .frame{border:1px solid #4b4b4b;overflow:visible;background:#fff;}',
+      '#'+PANEL+' table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:10pt;}',
+      '#'+PANEL+' th,#'+PANEL+' td{padding:.28em .45em;border-right:1px solid rgba(75,75,75,.4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#111;}',
+      '#'+PANEL+' th:last-child,#'+PANEL+' td:last-child{border-right:none;}',
+      '#'+PANEL+' thead th{position:sticky;top:0;z-index:2;cursor:pointer;background:#336699;color:#fff;font-weight:bold;text-align:left;}',
+      '#'+PANEL+' .num{text-align:right;}',
+      '#'+PANEL+' tr.month td{font-weight:bold;background:#eef3f8;border-right:none;border-top:1px solid #4b4b4b;border-bottom:1px solid #4b4b4b;white-space:normal;overflow:visible;}',
+      '#'+PANEL+' tr.pad td{padding:0;border:none;background:transparent;}',
+      '#'+PANEL+' tr.inc td.num{color:#0a7a20;} #'+PANEL+' tr.out td.num{color:#b00000;}',
+      '#'+PANEL+' tbody tr.row:nth-child(even) td{background:rgba(51,102,153,.06);}',
+      '#sccl-tip{position:fixed;z-index:100001;display:none;max-width:440px;background:#fff;color:#111;border:1px solid #4b4b4b;box-shadow:0 8px 22px rgba(0,0,0,.3);padding:8px 10px;font:10pt arial,helvetica,sans-serif;white-space:pre-wrap;pointer-events:none;}'
+    ].join('');
+    (document.head || document.documentElement).appendChild(s);
+    tipEl = document.createElement('div');
+    tipEl.id = 'sccl-tip';
+    document.body.appendChild(tipEl);
+  }
+
+  function textOf(node) {
+    if (!node) return '';
+    var c = node.cloneNode(true);
+    var imgs = c.querySelectorAll ? c.querySelectorAll('img') : [];
+    for (var i = 0; i < imgs.length; i++) imgs[i].remove();
+    return (c.innerText || c.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"'); }
+  function blank(s) { return !String(s || '').trim(); }
+
+  function financeRoot() {
+    return document.getElementById('da_cloned_contents') || document.getElementById('ctg_contents') || document.getElementById('pw_contents');
+  }
+  function cashOpen() {
+    if (/miDesktopTab=6\b/.test(location.href) || /miDesktopTab=6\b/.test(lastHtml.slice(0, 400))) return true;
+    var sel = document.querySelectorAll('li.desktop_tabpage_selected a');
+    for (var i = 0; i < sel.length; i++) {
+      var blob = (sel[i].getAttribute('onclick') || '') + ' ' + (sel[i].getAttribute('title') || '') + ' ' + sel[i].textContent;
+      if (/miDesktopTab=6\b|cash log|recent cash/i.test(blob)) return true;
+    }
+    var root = financeRoot();
+    return !!(root && /recent cash changes|cash log/i.test(root.textContent || ''));
+  }
+  function pageMode() {
+    var href = location.href;
+    if (/[?&]SN_METHOD=tsl\b/i.test(href) || /cgiw\?tsl\b/i.test(href)) return 'tsl';
+    if (/[?&]SN_METHOD=tbl\b/i.test(href) || /cgiw\?tbl\b/i.test(href)) return 'tbl';
+    return cashOpen() ? 'cash' : '';
+  }
+  function tradePage() { var m = pageMode(); return m === 'tsl' || m === 'tbl'; }
+  function titleWidth() {
+    var title = document.getElementById('cdh_title0');
+    var bar = title && title.closest ? title.closest('table') : document.querySelector('table.dt_titlebar');
+    var node = bar || title;
+    if (!node) return null;
+    var w = node.getBoundingClientRect().width;
+    if (w < 240 && node.parentNode) w = node.parentNode.getBoundingClientRect().width;
+    return w > 240 ? Math.floor(w) : null;
+  }
+  function tradeNextFrom(doc) {
+    var method = pageMode();
+    var anchors = doc.querySelectorAll('a[href]');
+    for (var i = 0; i < anchors.length; i++) {
+      var href = anchors[i].getAttribute('href') || '';
+      if (href.indexOf('SN_METHOD=' + method) === -1 || href.indexOf('miTradeTransaction=') === -1 || href.indexOf('next=') === -1) continue;
+      return absUrl(href);
+    }
+    var forms = doc.querySelectorAll('form');
+    for (var f = 0; f < forms.length; f++) {
+      var form = forms[f];
+      var fields = {};
+      var inputs = form.querySelectorAll('input[name]');
+      for (var n = 0; n < inputs.length; n++) fields[inputs[n].name] = inputs[n].value;
+      if (fields.SN_METHOD !== method || !fields.miTradeTransaction || fields.next == null) continue;
+      var params = ['SN_ADDRESS', 'SN_METHOD', 'miEntityKind', 'miEntityNumber', 'miTradeTransaction', 'next'];
+      var query = params.filter(function (key) { return fields[key] != null && fields[key] !== ''; }).map(function (key) {
+        return encodeURIComponent(key) + '=' + encodeURIComponent(fields[key]);
+      }).join('&');
+      var action = form.getAttribute('action') || '/cgi-bin/cgi2nova';
+      return absUrl(action + (action.indexOf('?') === -1 ? '?' : '&') + query);
+    }
+    return '';
+  }
+})();
