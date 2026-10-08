@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Simcountry Cash Log — endless, sort, filter
 // @namespace    https://simcountry.com/userscripts/cash-log-endless
-// @version      1.4.6
+// @version      1.5.0
 // @author       TheWalkingGlitch
-// @description  Read the Cash Log applet payload, keep only text columns, sort, filter, export CSV, and stop crawling at an optional row cap.
+// @description  Sort, filter, and cap the Cash Log, Recent Sales (tsl), and Recent Purchases (tbl). Older pages come only from the page's own next link or Next form.
 // @match        *://*.simcountry.com/*
 // @match        *://simcountry.com/*
 // @run-at       document-idle
@@ -27,6 +27,22 @@
  * which writes the body into #da_cloned_contents. Guessed miFrom / miPageStartPos
  * requests are not part of that path; they were pulling other finance tables
  * into this log. This version reads only the cash-log table from that payload.
+ *
+ * Recent Sales and Recent Purchases are full pages:
+ *   /cgi-bin/cgiw?tsl
+ *   /cgi-bin/cgiw?tbl
+ * The table lives in #pw_contents. Paging is a GET form, not an applet cursor:
+ *   action /cgi-bin/cgi2nova
+ *   SN_ADDRESS=wwwCountry
+ *   SN_METHOD=tsl|tbl
+ *   miEntityKind, miEntityNumber
+ *   miTradeTransaction=<last row on this page>
+ *   next=Next >
+ * Page 1 has only Next. Later pages also have First (no transaction id).
+ * The next page repeats the cursor row as its first row, then older trades.
+ * This script submits that Next form and drops the repeated row. It does not
+ * invent miFrom / miPageStartPos. Unit price scales as quality/100 against the
+ * Q100 column, so line value is quantity times the price received or paid.
  */
 (function () {
   'use strict';
@@ -34,18 +50,20 @@
   var PANEL = 'sc-cashlog-endless';
   var MONTHS = { jan:1, january:1, feb:2, february:2, mar:3, march:3, apr:4, april:4, may:5, jun:6, june:6, jul:7, july:7, aug:8, august:8, sep:9, sept:9, september:9, oct:10, october:10, nov:11, november:11, dec:12, december:12 };
   var MNAME = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  var PAGE = 20;
   var lastHtml = '';
   var lastReq = '';
+  var tradeHtml = '';
   var nextUrl = '';
 
   var state = {
+    mode: 'cash', tradeKind: '',
     rows: [], headers: [], kinds: [],
     sortCol: -1, sortDir: -1,
     filter: '', flow: 'all', month: 'all', breaks: true,
+    product: 'all', minQ: 0,
     capOn: true, capN: 1000,
     rendered: 120, loading: false, exhausted: false,
-    scheme: '', offset: 21, status: '', sig: '', seen: {}
+    scheme: '', offset: 21, status: '', sig: '', seen: {}, cursors: {}
   };
   var tipTimer = null, tipEl = null;
 
@@ -87,7 +105,9 @@
     for (var i = 0; i < imgs.length; i++) imgs[i].remove();
     return (c.innerText || c.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
   }
-  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"'); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"');
+  }
   function blank(s) { return !String(s || '').trim(); }
 
   function financeRoot() {
@@ -103,6 +123,31 @@
     var root = financeRoot();
     return !!(root && /recent cash changes|cash log/i.test(root.textContent || ''));
   }
+  function tradeKindFrom(href, text) {
+    href = href || '';
+    text = text || '';
+    if (/[?&]tsl(?:&|=|$)/.test(href) || /SN_METHOD=tsl\b/.test(href) || /recent sales/i.test(text)) return 'sales';
+    if (/[?&]tbl(?:&|=|$)/.test(href) || /SN_METHOD=tbl\b/.test(href) || /recent purchases/i.test(text)) return 'purchases';
+    return '';
+  }
+  function tradeRoot() {
+    var nodes = [
+      document.getElementById('pw_contents'),
+      document.getElementById('da_cloned_contents'),
+      document.getElementById('da_contents'),
+      document.getElementById('ctg_contents'),
+      document.body
+    ];
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i] && /recent sales|recent purchases/i.test(nodes[i].textContent || '')) return nodes[i];
+    }
+    return financeRoot();
+  }
+  function tradeKind() {
+    var root = tradeRoot();
+    var text = ((root && root.textContent) || '') + ' ' + (document.title || '');
+    return tradeKindFrom(location.href, text) || tradeKindFrom('', tradeHtml) || '';
+  }
   function titleWidth() {
     var title = document.getElementById('cdh_title0');
     var bar = title && title.closest ? title.closest('table') : document.querySelector('table.dt_titlebar');
@@ -111,6 +156,17 @@
     var w = node.getBoundingClientRect().width;
     if (w < 240 && node.parentNode) w = node.parentNode.getBoundingClientRect().width;
     return w > 240 ? Math.floor(w) : null;
+  }
+  function panelWidth() {
+    var w = titleWidth();
+    if (w) return w;
+    if (state.mode !== 'trade') return null;
+    var root = financeRoot();
+    var table = root && root.querySelector('table.datagroup');
+    var node = table || root;
+    if (!node || !node.getBoundingClientRect) return null;
+    var ww = node.getBoundingClientRect().width;
+    return ww > 240 ? Math.floor(ww) : null;
   }
 
   function parseAmount(raw) {
@@ -135,6 +191,10 @@
     else if (a >= 1e6) { v = a / 1e6; suf = 'M'; }
     else if (a >= 1e3) { v = a / 1e3; suf = 'K'; }
     return sign + v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + suf + ' SC$';
+  }
+  function formatQty(n) {
+    if (n == null || !isFinite(n)) return '';
+    return Math.round(n).toLocaleString('en-US');
   }
   function parseGameDate(raw) {
     if (!raw) return null;
@@ -249,7 +309,7 @@
     var kinds = headers.map(function (h, col) {
       var hl = h.toLowerCase();
       if (/date|month|when|time/.test(hl)) return 'date';
-      if (/amount|change|cash|income|cost|paid|balance|sum/.test(hl)) return 'num';
+      if (/amount|change|cash|income|cost|paid|balance|sum|quantity|quality|price|value/.test(hl)) return 'num';
       var dates = 0, nums = 0;
       rows.slice(0, 10).forEach(function (row) {
         if (parseGameDate(row.texts[col])) dates++;
@@ -262,19 +322,82 @@
     return { headers: headers, kinds: kinds, rows: rows, score: rows.length + (headers.join(' ').match(/cash|amount|date/i) ? 10 : 0) };
   }
 
-  function parseRoot(root) {
+  function colIndex(headers, test) {
+    for (var i = 0; i < headers.length; i++) if (test(headers[i].toLowerCase())) return i;
+    return -1;
+  }
+  function tradeShape(parsed, kind) {
+    var headers = parsed.headers;
+    var iProd = colIndex(headers, function (h) { return h.indexOf('product') !== -1; });
+    var iWhen = colIndex(headers, function (h) { return /when|date/.test(h); });
+    var iQty = colIndex(headers, function (h) { return h.indexOf('quantity') !== -1; });
+    var iQual = colIndex(headers, function (h) { return h.indexOf('quality') !== -1; });
+    var iUnit = colIndex(headers, function (h) { return /price received|price paid/.test(h); });
+    var iQ100 = colIndex(headers, function (h) { return h === 'price'; });
+    var iEvent = colIndex(headers, function (h) { return /happened|event/.test(h); });
+    var sign = kind === 'purchases' ? -1 : 1;
+    var rows = parsed.rows.map(function (row) {
+      var prodCell = iProd >= 0 ? row.texts[iProd] : '';
+      var parts = prodCell.split(/\s+on\s+/i);
+      var product = parts[0] || prodCell;
+      var market = parts.length > 1 ? parts.slice(1).join(' on ') : '';
+      var qty = iQty >= 0 ? parseAmount(row.texts[iQty]) : null;
+      var quality = iQual >= 0 ? parseAmount(row.texts[iQual]) : null;
+      var unit = iUnit >= 0 ? parseAmount(row.texts[iUnit]) : null;
+      var q100 = iQ100 >= 0 ? parseAmount(row.texts[iQ100]) : null;
+      var line = qty != null && unit != null ? qty * unit : null;
+      if (!product && qty == null && unit == null) return null;
+      var when = iWhen >= 0 ? row.texts[iWhen] : (row.date ? row.date.label : '');
+      var event = iEvent >= 0 ? row.texts[iEvent] : '';
+      var texts = [
+        product, market, when,
+        qty == null ? '' : formatQty(qty),
+        quality == null ? '' : String(Math.round(quality)),
+        unit == null ? '' : formatQty(unit) + ' SC$',
+        q100 == null ? '' : formatQty(q100) + ' SC$',
+        line == null ? '' : formatAmount(sign * line),
+        event
+      ];
+      return {
+        texts: texts,
+        date: row.date,
+        month: row.month,
+        amount: line == null ? null : sign * line,
+        qty: qty, quality: quality, product: product, market: market,
+        key: [product, market, when, qty, quality, unit, event].join('|').toLowerCase()
+      };
+    }).filter(Boolean);
+    return {
+      headers: ['Product', 'Market', 'When', 'Quantity', 'Quality', 'Unit price', 'Q100 price', 'Line value', 'What happened?'],
+      kinds: ['text', 'text', 'date', 'num', 'num', 'num', 'num', 'num', 'text'],
+      rows: rows,
+      score: rows.length + 100
+    };
+  }
+
+  function parseRoot(root, mode) {
     var tables = innermostTables(root);
     var best = null;
     tables.forEach(function (table) {
       var cap = '';
       var wrap = table.parentNode && table.parentNode.closest ? table.parentNode.closest('table') : null;
       if (wrap) cap = textOf(wrap.querySelector('caption'));
+      var near = '';
+      var hop = table.parentNode;
+      for (var n = 0; n < 4 && hop; n++) { near += ' ' + textOf(hop); hop = hop.parentNode; }
       if (/profit\s*&\s*loss|expected full year|year to date|cash ytd/i.test(cap)) return;
       var parsed = parseTable(table);
       if (!parsed) return;
-      var named = /cash log|recent cash/i.test(cap);
-      if (named) parsed.score += 100;
-      else if (!/when|date/.test(parsed.headers.join(' ').toLowerCase()) || parsed.kinds.indexOf('num') === -1) return;
+      if (mode === 'trade') {
+        var named = /recent sales|recent purchases/i.test(cap + ' ' + near);
+        var tradeish = /when/.test(parsed.headers.join(' ').toLowerCase()) && /product|quality|quantity/.test(parsed.headers.join(' ').toLowerCase());
+        if (!named && !tradeish) return;
+        if (named) parsed.score += 100;
+      } else {
+        var namedCash = /cash log|recent cash/i.test(cap);
+        if (namedCash) parsed.score += 100;
+        else if (!/when|date/.test(parsed.headers.join(' ').toLowerCase()) || parsed.kinds.indexOf('num') === -1) return;
+      }
       if (!best || parsed.score > best.score) best = parsed;
     });
     return best;
@@ -317,11 +440,12 @@
       if (label && !first) first = label;
       if (label) last = label;
     });
-    var country = fileSlug((document.getElementById('cdh_title0') || {}).textContent) || 'country';
-    var flow = state.flow === 'in' ? 'income' : state.flow === 'out' ? 'spending' : 'all';
+    var country = fileSlug((document.getElementById('cdh_title0') || {}).textContent) || fileSlug((document.title || '').replace(/^Simcountry:\s*/i, '')) || 'country';
+    var flow = state.mode === 'trade' ? (state.tradeKind || 'trade') : (state.flow === 'in' ? 'income' : state.flow === 'out' ? 'spending' : 'all');
     var month = state.month === 'all' ? 'all-months' : fileSlug(state.month);
     var range = first && last ? fileSlug(first) + '_to_' + fileSlug(last) : 'no-dates';
-    var name = ['cash-log', country, flow, month, range, rows.length + 'rows'].filter(Boolean).join('_') + '.csv';
+    var prefix = state.mode === 'trade' ? (state.tradeKind === 'purchases' ? 'purchases' : 'sales') : 'cash-log';
+    var name = [prefix, country, flow, month, range, rows.length + 'rows'].filter(Boolean).join('_') + '.csv';
     var blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -366,13 +490,43 @@
     base = base.replace(/[&?]miTradeTransaction=\d+/, '');
     return base + (base.indexOf('?') === -1 ? '?' : '&') + 'miTradeTransaction=' + ids[0];
   }
+  function tradeNextFrom(doc) {
+    var forms = doc.querySelectorAll('form');
+    for (var i = 0; i < forms.length; i++) {
+      var form = forms[i];
+      var next = form.querySelector('input[name="next"]');
+      if (!next) continue;
+      var method = form.querySelector('input[name="SN_METHOD"]');
+      if (!method || !/^(tsl|tbl)$/i.test(method.value || '')) continue;
+      var cursor = '';
+      var params = [];
+      var inputs = form.querySelectorAll('input');
+      for (var j = 0; j < inputs.length; j++) {
+        var inp = inputs[j];
+        if (!inp.name) continue;
+        if ((inp.type || '').toLowerCase() === 'submit' && inp.name !== 'next') continue;
+        if (inp.name === 'miTradeTransaction') cursor = inp.value || '';
+        params.push(encodeURIComponent(inp.name) + '=' + encodeURIComponent(inp.value == null ? '' : String(inp.value)));
+      }
+      if (!cursor) continue;
+      var action = form.getAttribute('action') || '/cgi-bin/cgi2nova';
+      if (!/^https?:/i.test(action)) action = location.origin + (action.charAt(0) === '/' ? action : '/' + action);
+      return { url: action + (action.indexOf('?') === -1 ? '?' : '&') + params.join('&'), cursor: cursor };
+    }
+    return null;
+  }
 
   function visible() {
     var q = state.filter.trim().toLowerCase();
     return state.rows.filter(function (row) {
       if (state.month !== 'all' && (!row.month || row.month.label !== state.month)) return false;
-      if (state.flow === 'in' && !(row.amount > 0)) return false;
-      if (state.flow === 'out' && !(row.amount < 0)) return false;
+      if (state.mode !== 'trade') {
+        if (state.flow === 'in' && !(row.amount > 0)) return false;
+        if (state.flow === 'out' && !(row.amount < 0)) return false;
+      } else {
+        if (state.product !== 'all' && row.product !== state.product) return false;
+        if (state.minQ && !(row.quality >= state.minQ)) return false;
+      }
       if (q && row.texts.join(' ').toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
@@ -389,9 +543,13 @@
     return 0;
   }
   function totals(rows) {
-    var inc = 0, out = 0;
-    rows.forEach(function (row) { if (row.amount == null) return; if (row.amount >= 0) inc += row.amount; else out += row.amount; });
-    return { inc: inc, out: out, net: inc + out };
+    var inc = 0, out = 0, qty = 0;
+    rows.forEach(function (row) {
+      if (row.qty) qty += row.qty;
+      if (row.amount == null) return;
+      if (row.amount >= 0) inc += row.amount; else out += row.amount;
+    });
+    return { inc: inc, out: out, net: inc + out, qty: qty };
   }
   function ordered() { var rows = visible(); return state.sortCol < 0 ? rows : rows.slice().sort(compare); }
 
@@ -402,7 +560,7 @@
       if (!group.length) return;
       var label = group[0].month ? group[0].month.label : 'Undated';
       var g = totals(group);
-      items.push({ type: 'month', label: label, n: group.length, inc: g.inc, out: g.out, net: g.net });
+      items.push({ type: 'month', label: label, n: group.length, inc: g.inc, out: g.out, net: g.net, qty: g.qty });
       group.forEach(function (row) { items.push({ type: 'row', row: row }); });
       group = [];
     }
@@ -429,7 +587,12 @@
     var tot = totals(state.shown || []);
     var st = panel.querySelector('.stat');
     if (!st) return;
-    st.textContent = (state.shown ? state.shown.length : 0) + ' on page / ' + rows.length + ' matching / ' + state.rows.length + ' loaded' + (state.capOn ? ' · cap ' + state.capN : '') + ' · net ' + formatAmount(tot.net || 0) + (state.loading ? ' · loading older…' : '') + (capHit() ? ' · stopped at cap' : '') + (state.exhausted ? ' · no further page' : '') + (state.status ? ' · ' + state.status : '');
+    var tail = (state.loading ? ' · loading older…' : '') + (capHit() ? ' · stopped at cap' : '') + (state.exhausted ? ' · no further page' : '') + (state.status ? ' · ' + state.status : '');
+    if (state.mode === 'trade') {
+      st.textContent = (state.shown ? state.shown.length : 0) + ' on page / ' + rows.length + ' matching / ' + state.rows.length + ' loaded' + (state.capOn ? ' · cap ' + state.capN : '') + ' · qty ' + formatQty(tot.qty || 0) + ' · line ' + formatAmount(tot.net || 0) + tail;
+    } else {
+      st.textContent = (state.shown ? state.shown.length : 0) + ' on page / ' + rows.length + ' matching / ' + state.rows.length + ' loaded' + (state.capOn ? ' · cap ' + state.capN : '') + ' · net ' + formatAmount(tot.net || 0) + tail;
+    }
   }
   function extendPage(all) {
     var panel = document.getElementById(PANEL);
@@ -441,7 +604,8 @@
     for (var i = state.cursor; i < end; i++) {
       var item = state.items[i];
       if (item.type === 'month') {
-        html += '<tr class="month"><td colspan="' + Math.max(1, state.headers.length) + '">' + esc(item.label) + ' · ' + item.n + ' · in ' + formatAmount(item.inc) + ' · out ' + formatAmount(item.out) + ' · net ' + formatAmount(item.net) + '</td></tr>';
+        var extra = state.mode === 'trade' ? ' · qty ' + formatQty(item.qty || 0) + ' · line ' + formatAmount(item.net) : ' · in ' + formatAmount(item.inc) + ' · out ' + formatAmount(item.out) + ' · net ' + formatAmount(item.net);
+        html += '<tr class="month"><td colspan="' + Math.max(1, state.headers.length) + '">' + esc(item.label) + ' · ' + item.n + extra + '</td></tr>';
       } else {
         html += rowHtml(item.row);
         state.shown.push(item.row);
@@ -472,10 +636,10 @@
   function render(force) {
     var panel = document.getElementById(PANEL);
     if (!panel) return;
-    var w = titleWidth();
+    var w = panelWidth();
     if (w) { panel.style.width = w + 'px'; panel.style.maxWidth = '100%'; }
     var rows = ordered();
-    var viewSig = [state.sortCol, state.sortDir, state.filter, state.flow, state.month, state.breaks, state.headers.join('|')].join('~');
+    var viewSig = [state.mode, state.sortCol, state.sortDir, state.filter, state.flow, state.month, state.breaks, state.product, state.minQ, state.headers.join('|')].join('~');
     var frame = panel.querySelector('.frame');
     if (!force && viewSig === state.viewSig && frame && frame.querySelector('tbody')) {
       state.items = displayItems(rows);
@@ -493,9 +657,20 @@
       return '<option value="' + esc(m) + '"' + (m === state.month ? ' selected' : '') + '>' + esc(m) + '</option>';
     }).join('');
     if (sel && sel.innerHTML !== monthHtml) sel.innerHTML = monthHtml;
+    var prod = panel.querySelector('[data-role="product"]');
+    if (prod) {
+      var products = {};
+      state.rows.forEach(function (row) { if (row.product) products[row.product] = 1; });
+      var prodHtml = '<option value="all">All products</option>' + Object.keys(products).sort().map(function (p) {
+        return '<option value="' + esc(p) + '"' + (p === state.product ? ' selected' : '') + '>' + esc(p) + '</option>';
+      }).join('');
+      if (prod.innerHTML !== prodHtml) prod.innerHTML = prodHtml;
+    }
     var head = '<tr>' + state.headers.map(function (h, i) {
       var kind = state.kinds[i] || 'text';
-      var width = kind === 'date' ? '16%' : kind === 'num' ? '14%' : '';
+      var width = state.mode === 'trade'
+        ? (kind === 'date' ? '12%' : kind === 'num' ? '10%' : '')
+        : (kind === 'date' ? '16%' : kind === 'num' ? '14%' : '');
       return '<th class="' + (kind === 'num' ? 'num' : '') + '" data-col="' + i + '"' + (width ? ' style="width:' + width + '"' : '') + '>' + esc(h) + (state.sortCol === i ? (state.sortDir > 0 ? ' ▲' : ' ▼') : '') + '</th>';
     }).join('') + '</tr>';
     frame.innerHTML = '<table><thead>' + head + '</thead><tbody></tbody></table>';
@@ -509,26 +684,48 @@
       return;
     }
     if (state.loading || state.exhausted || !nextUrl) {
-      if (!nextUrl) state.status = 'no older-page link in the cash log response';
+      if (!nextUrl) state.status = state.mode === 'trade' ? 'no Next form on this page' : 'no older-page link in the cash log response';
       paintStatus();
       return;
     }
     state.loading = true;
     var url = nextUrl;
+    var method = state.mode === 'trade' ? 'GET' : 'POST';
     paintStatus();
-    fetch(url, { method: 'POST', credentials: 'include' }).then(function (r) { return r.text(); }).then(function (html) {
+    fetch(url, { method: method, credentials: 'include' }).then(function (r) { return r.text(); }).then(function (html) {
+      if (state.mode === 'trade') {
+        if (!/recent sales|recent purchases|SN_METHOD/i.test(html)) {
+          state.exhausted = true;
+          state.status = 'older request was not another sales or purchases page';
+          return;
+        }
+        var doc = docFrom(html);
+        var parsed = parseRoot(doc.body, 'trade');
+        var added = merge(parsed ? tradeShape(parsed, state.tradeKind) : null);
+        var nxt = tradeNextFrom(doc);
+        if (!added || !nxt || nxt.url === url || state.cursors[nxt.cursor]) {
+          state.exhausted = true;
+          nextUrl = '';
+          state.status = added ? '' : 'server returned no further trade rows';
+        } else {
+          state.cursors[nxt.cursor] = 1;
+          nextUrl = nxt.url;
+          state.status = state.rows.length + ' rows';
+        }
+        return;
+      }
       if (!/cash log|recent cash|miDesktopTab=6|when/i.test(html)) {
         state.exhausted = true;
         state.status = 'older request was not another cash-log window';
         return;
       }
-      var added = merge(parseRoot(docFrom(html).body));
-      var nxt = discoverNext(html);
-      if (!added || nxt === url) {
+      var addedCash = merge(parseRoot(docFrom(html).body));
+      var nxtCash = discoverNext(html);
+      if (!addedCash || nxtCash === url) {
         state.exhausted = true;
-        state.status = added ? '' : 'server returned no further cash-log rows';
+        state.status = addedCash ? '' : 'server returned no further cash-log rows';
       } else {
-        nextUrl = nxt;
+        nextUrl = nxtCash;
         state.status = state.rows.length + ' rows';
       }
     }).catch(function () {
@@ -541,49 +738,78 @@
     });
   }
 
-  function ensurePanel(anchor) {
+  function panelMarkup(mode, kind) {
+    if (mode === 'trade') {
+      var title = kind === 'purchases' ? 'Recent purchases — loaded history' : 'Recent sales — loaded history';
+      return '<div class="cap">' + title + '</div><div class="tools"><label>Filter <input type="search" data-role="filter" placeholder="product, market, event"></label><label>Product <select data-role="product"><option value="all">All products</option></select></label><label>Min quality <input type="number" data-role="minq" min="0" step="1" style="width:4.5em"></label><label>Month <select data-role="month"><option value="all">All game months</option></select></label><label><input type="checkbox" data-role="breaks" checked> Month breaks</label><label><input type="checkbox" data-role="cap" checked> Cap rows <input type="number" data-role="capn" min="1" step="1" value="1000" style="width:5em"></label><button type="button" data-role="older">Load older</button><button type="button" data-role="csv">Export CSV</button><button type="button" data-role="reset">Reset sort</button></div><div class="stat"></div><div class="frame"></div>';
+    }
+    return '<div class="cap">Cash log — loaded history</div><div class="tools"><label>Filter <input type="search" data-role="filter" placeholder="any column"></label><label>Flow <select data-role="flow"><option value="all">All</option><option value="in">Income</option><option value="out">Spending</option></select></label><label>Month <select data-role="month"><option value="all">All game months</option></select></label><label><input type="checkbox" data-role="breaks" checked> Month breaks</label><label><input type="checkbox" data-role="cap" checked> Cap rows <input type="number" data-role="capn" min="1" step="1" value="1000" style="width:5em"></label><button type="button" data-role="older">Load older</button><button type="button" data-role="csv">Export CSV</button><button type="button" data-role="reset">Reset sort</button></div><div class="stat"></div><div class="frame"></div>';
+  }
+  function bindPanel(panel) {
+    if (panel.getAttribute('data-bound') === '1') return;
+    panel.setAttribute('data-bound', '1');
+    panel.addEventListener('click', function (ev) {
+      var th = ev.target.closest && ev.target.closest('th[data-col]');
+      if (!th) return;
+      ev.preventDefault(); ev.stopPropagation();
+      var col = parseInt(th.getAttribute('data-col'), 10);
+      if (state.sortCol === col) state.sortDir = -state.sortDir;
+      else { state.sortCol = col; state.sortDir = state.kinds[col] === 'text' ? 1 : -1; }
+      render(true);
+    });
+    panel.addEventListener('input', function (ev) {
+      var role = ev.target.getAttribute && ev.target.getAttribute('data-role');
+      if (role === 'filter') { state.filter = ev.target.value; render(true); }
+      if (role === 'minq') {
+        var qn = parseInt(ev.target.value, 10);
+        state.minQ = qn > 0 ? qn : 0;
+        render(true);
+      }
+    });
+    panel.addEventListener('change', function (ev) {
+      var role = ev.target.getAttribute && ev.target.getAttribute('data-role');
+      if (role === 'flow') { state.flow = ev.target.value; render(true); }
+      if (role === 'month') { state.month = ev.target.value; render(true); }
+      if (role === 'product') { state.product = ev.target.value; render(true); }
+      if (role === 'breaks') { state.breaks = ev.target.checked; render(true); }
+      if (role === 'cap') { state.capOn = ev.target.checked; render(); }
+      if (role === 'capn') {
+        var n = parseInt(ev.target.value, 10);
+        state.capN = n > 0 ? n : 1000;
+        render();
+      }
+    });
+    panel.addEventListener('mouseover', armTip);
+    panel.addEventListener('mouseout', function (ev) { if (!(ev.relatedTarget && panel.contains(ev.relatedTarget))) hideTip(); });
+    panel.addEventListener('click', function (ev) {
+      var role = ev.target.getAttribute && ev.target.getAttribute('data-role');
+      if (role === 'older') { state.exhausted = false; loadOlder(); }
+      if (role === 'csv') exportCsv();
+      if (role === 'reset') {
+        state.sortCol = -1; state.filter = ''; state.flow = 'all'; state.month = 'all'; state.product = 'all'; state.minQ = 0;
+        var f = panel.querySelector('[data-role="filter"]'); if (f) f.value = '';
+        var flow = panel.querySelector('[data-role="flow"]'); if (flow) flow.value = 'all';
+        var mq = panel.querySelector('[data-role="minq"]'); if (mq) mq.value = '';
+        render(true);
+      }
+    });
+  }
+  function ensurePanel(anchor, mode, kind) {
     addStyle();
     var panel = document.getElementById(PANEL);
     if (!panel) {
       panel = document.createElement('div');
       panel.id = PANEL;
-      panel.innerHTML = '<div class="cap">Cash log — loaded history</div><div class="tools"><label>Filter <input type="search" data-role="filter" placeholder="any column"></label><label>Flow <select data-role="flow"><option value="all">All</option><option value="in">Income</option><option value="out">Spending</option></select></label><label>Month <select data-role="month"><option value="all">All game months</option></select></label><label><input type="checkbox" data-role="breaks" checked> Month breaks</label><label><input type="checkbox" data-role="cap" checked> Cap rows <input type="number" data-role="capn" min="1" step="1" value="1000" style="width:5em"></label><button type="button" data-role="older">Load older</button><button type="button" data-role="csv">Export CSV</button><button type="button" data-role="reset">Reset sort</button></div><div class="stat"></div><div class="frame"></div>';
-      panel.addEventListener('click', function (ev) {
-        var th = ev.target.closest && ev.target.closest('th[data-col]');
-        if (!th) return;
-        ev.preventDefault(); ev.stopPropagation();
-        var col = parseInt(th.getAttribute('data-col'), 10);
-        if (state.sortCol === col) state.sortDir = -state.sortDir;
-        else { state.sortCol = col; state.sortDir = state.kinds[col] === 'text' ? 1 : -1; }
-        render(true);
-      });
-      panel.addEventListener('mouseover', armTip);
-      panel.addEventListener('mouseout', function (ev) { if (!(ev.relatedTarget && panel.contains(ev.relatedTarget))) hideTip(); });
-      panel.querySelector('[data-role="filter"]').addEventListener('input', function (ev) { state.filter = ev.target.value; render(true); });
-      panel.querySelector('[data-role="flow"]').addEventListener('change', function (ev) { state.flow = ev.target.value; render(true); });
-      panel.querySelector('[data-role="month"]').addEventListener('change', function (ev) { state.month = ev.target.value; render(true); });
-      panel.querySelector('[data-role="breaks"]').addEventListener('change', function (ev) { state.breaks = ev.target.checked; render(true); });
-      panel.querySelector('[data-role="older"]').addEventListener('click', function () {
-        state.exhausted = false;
-        loadOlder();
-      });
-      panel.querySelector('[data-role="csv"]').addEventListener('click', exportCsv);
-      panel.querySelector('[data-role="cap"]').addEventListener('change', function (ev) {
-        state.capOn = ev.target.checked;
-        render();
-      });
-      panel.querySelector('[data-role="capn"]').addEventListener('change', function (ev) {
-        var n = parseInt(ev.target.value, 10);
-        state.capN = n > 0 ? n : 1000;
-        render();
-      });
-      panel.querySelector('[data-role="reset"]').addEventListener('click', function () {
-        state.sortCol = -1; state.filter = ''; state.flow = 'all'; state.month = 'all';
-        panel.querySelector('[data-role="filter"]').value = '';
-        panel.querySelector('[data-role="flow"]').value = 'all';
-        render(true);
-      });
     }
+    if (panel.getAttribute('data-mode') !== mode) {
+      panel.setAttribute('data-mode', mode);
+      panel.innerHTML = panelMarkup(mode, kind);
+    } else if (mode === 'trade') {
+      var cap = panel.querySelector('.cap');
+      var want = kind === 'purchases' ? 'Recent purchases — loaded history' : 'Recent sales — loaded history';
+      if (cap && cap.textContent !== want) cap.textContent = want;
+    }
+    bindPanel(panel);
     panel.style.display = '';
     var host = anchor && anchor.parentNode ? anchor.parentNode : financeRoot();
     if (host && panel.parentNode !== host) host.appendChild(panel);
@@ -591,35 +817,81 @@
     return panel;
   }
 
+  function resetRows() {
+    state.rows = []; state.seen = {}; state.headers = []; state.cursors = {};
+    state.exhausted = false; nextUrl = '';
+  }
+  function scanTrade(kind) {
+    state.mode = 'trade';
+    state.tradeKind = kind;
+    var root = tradeRoot();
+    ensurePanel(root, 'trade', kind);
+    var source = tradeHtml || '';
+    var parsed = null;
+    if (source && /recent sales|recent purchases|SN_METHOD/i.test(source)) parsed = parseRoot(docFrom(source).body, 'trade');
+    if (!parsed && root) parsed = parseRoot(root, 'trade');
+    if (!parsed || !parsed.rows.length) {
+      state.status = source ? 'payload had no rows' : 'waiting for the sales or purchases table';
+      render();
+      return;
+    }
+    var shaped = tradeShape(parsed, kind);
+    var sig = kind + '~' + shaped.rows.slice(0, 2).map(function (r) { return r.key; }).join('~') + '|' + shaped.rows.length;
+    if (sig === state.sig && state.rows.length) return;
+    state.sig = sig;
+    resetRows();
+    merge(shaped);
+    var doc = source ? docFrom(source) : document;
+    var nxt = tradeNextFrom(doc);
+    if (nxt && !state.cursors[nxt.cursor]) {
+      state.cursors[nxt.cursor] = 1;
+      nextUrl = nxt.url;
+      state.exhausted = false;
+      state.status = '';
+    } else {
+      nextUrl = '';
+      state.exhausted = true;
+      state.status = 'no Next form on this page';
+    }
+    render(true);
+    if (nextUrl && !capHit()) loadOlder();
+  }
+  function scanCash() {
+    state.mode = 'cash';
+    state.tradeKind = '';
+    var root = financeRoot();
+    ensurePanel(root, 'cash', '');
+    var parsed = null;
+    if (lastHtml && /miDesktopTab=6|cash log|recent cash/i.test(lastHtml)) parsed = parseRoot(docFrom(lastHtml).body);
+    if (!parsed && root) parsed = parseRoot(root);
+    if (!parsed || !parsed.rows.length) {
+      state.status = lastHtml ? 'payload had no rows' : 'waiting for the cash log payload';
+      render();
+      return;
+    }
+    var sig = parsed.rows.slice(0, 2).map(function (r) { return r.key; }).join('~') + '|' + parsed.rows.length;
+    if (sig === state.sig && state.rows.length) return;
+    state.sig = sig;
+    resetRows();
+    merge(parsed);
+    nextUrl = discoverNext(lastHtml || '');
+    state.exhausted = !nextUrl;
+    state.status = nextUrl ? '' : 'no older-page link in the cash log response';
+    render(true);
+    if (nextUrl && !capHit()) loadOlder();
+  }
   function scan() {
     try {
-      if (!cashOpen()) {
+      var kind = tradeKind();
+      if (!kind && !cashOpen()) {
         var gone = document.getElementById(PANEL);
         if (gone) gone.style.display = 'none';
         return;
       }
-      var root = financeRoot();
-      ensurePanel(root);
-      var parsed = null;
-      if (lastHtml && /miDesktopTab=6|cash log|recent cash/i.test(lastHtml)) parsed = parseRoot(docFrom(lastHtml).body);
-      if (!parsed && root) parsed = parseRoot(root);
-      if (!parsed || !parsed.rows.length) {
-        state.status = lastHtml ? 'payload had no rows' : 'waiting for the cash log payload';
-        render();
-        return;
-      }
-      var sig = parsed.rows.slice(0, 2).map(function (r) { return r.key; }).join('~') + '|' + parsed.rows.length;
-      if (sig === state.sig && state.rows.length) return;
-      state.sig = sig;
-      state.rows = []; state.seen = {}; state.headers = [];
-      merge(parsed);
-      nextUrl = discoverNext(lastHtml || '');
-      state.exhausted = !nextUrl;
-      state.status = nextUrl ? '' : 'no older-page link in the cash log response';
-      render(true);
-      if (nextUrl && !capHit()) loadOlder();
+      if (kind) scanTrade(kind);
+      else scanCash();
     } catch (err) {
-      ensurePanel(null);
+      ensurePanel(null, state.mode, state.tradeKind);
       state.status = err && err.message ? err.message : String(err);
       var st = document.querySelector('#' + PANEL + ' .stat');
       if (st) st.textContent = state.status;
@@ -635,11 +907,13 @@
     XMLHttpRequest.prototype.send = function () {
       this.addEventListener('load', function () {
         var url = this.__scclUrl || '';
+        var body = this.responseText || '';
         if (/jxGetDesktopApplet/i.test(url) && /miDesktopTab=6/.test(url)) {
           lastReq = url;
-          lastHtml = this.responseText || '';
+          lastHtml = body;
         }
-        if (/cfinance|jxGetDesktopApplet/i.test(url)) schedule();
+        if (/recent sales|recent purchases/i.test(body) && /SN_METHOD|miTradeTransaction|tsl|tbl/i.test(body)) tradeHtml = body;
+        if (/cfinance|jxGetDesktopApplet|tsl|tbl/i.test(url) || /recent sales|recent purchases/i.test(body)) schedule();
       });
       return send.apply(this, arguments);
     };
