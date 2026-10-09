@@ -4,7 +4,7 @@ Browser userscripts that take the busywork out of [Simcountry](https://www.simco
 
 This repo is a small toolkit for people who already play. It does not replace the game. It just makes a few of the most tedious pages easier to live with.
 
-[![Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](LICENSE)
+[![Tools Unlicense](https://img.shields.io/badge/tools-Unlicense-blue.svg)](LICENSE)
 [![Userscripts](https://img.shields.io/badge/requires-Tampermonkey-black.svg)](https://www.tampermonkey.net/)
 [![Game](https://img.shields.io/badge/game-Simcountry-0b5cab.svg)](https://www.simcountry.com/)
 
@@ -48,7 +48,8 @@ Preferences are stored in Tampermonkey / `localStorage`. They stay on your machi
 
 The stock loan page is a form plus a flat list. This script keeps the native submit path and layers a small toolkit on top of it.
 
-![Loan Offers toolkit on the loan-offer page](readmescreenshots/LoanOffersjs%20Example%20Screenshot.png)
+<img style="max-width:100%;height:auto;" alt="Loan Offers toolkit on the loan-offer page" src="readmescreenshots/LoanOffersjs%20Example%20Screenshot.png">
+
 *Loan Offers toolkit on the loan-offer page.*
 
 ### Features
@@ -107,7 +108,8 @@ Nothing is sent until you hit the site's own save button.
 
 Same idea as the order-strategy toolbox, pointed at the state salary grid. Checkboxes select corporations. Sorting and filters only reflow the live list. Apply writes the form fields; the site button **Set Salary Changes** is what actually saves.
 
-![Salary Tweaks toolbox on the salary-levels page](readmescreenshots/Salary%20Toolbox%20SS.png)
+<img style="max-width:100%;height:auto;" alt="Salary Tweaks toolbox on the salary-levels page" src="readmescreenshots/Salary%20Toolbox%20SS.png">
+
 *Salary Tweaks toolbox on the salary-levels page.*
 
 ### Features
@@ -139,7 +141,8 @@ Nothing is sent until you hit **Set Salary Changes**.
 
 Drag the country and enterprise tiles into the order you actually use, or pick a named sort. The ticker can be grabbed and flung instead of only auto-scrolling.
 
-![Portal desktop enhancer on the portal page](readmescreenshots/Portaljs%20Example%20Screenshot.png)
+<img style="max-width:100%;height:auto;" alt="Portal desktop enhancer on the portal page" src="readmescreenshots/Portaljs%20Example%20Screenshot.png">
+
 *Portal desktop enhancer on the portal page.*
 
 ### Widget features
@@ -175,7 +178,8 @@ Order and ticker prefs live in `localStorage` under `scEnhancer.v1`. From the co
 
 Cash Log is not its own page. The script reads that applet payload, drops empty spacer and history-icon columns, and paints a second table of the text columns. Sales and purchase pages get the same panel on their own tables. It does not invent page parameters, and it leaves profit & loss and year-to-date alone.
 
-![Cash Log toolkit on the cash-log page](readmescreenshots/SS%20Cash%20Log.png)
+<img style="max-width:100%;height:auto;" alt="Cash Log toolkit on the cash-log page" src="readmescreenshots/SS%20Cash%20Log.png">
+
 *Cash Log toolkit on the cash-log page.*
 
 ### Features
@@ -213,6 +217,38 @@ Screenshot: none yet.
 
 ---
 
+## World maps
+
+**Files:** [`World Maps/`](World%20Maps) — one self-contained HTML page per world, generator `Simcountry shaded world map 3.0.0`  
+**Author:** TheWalkingGlitch  
+**Runs on:** your browser, offline. These are saved snapshots, not a userscript, and they do not call the game when you open them.
+
+Each file is a shaded whole-world map from the morning of 9 Oct 2026 (Central). Download the HTML and open it locally. The page draws the map, a zoom bar, and a side panel. Search matches country name, country number, or president. Continent and region buttons jump the view. Hover a country for the tip. Dashed boxes are regions placed approximately.
+
+<img style="max-width:100%;height:auto;" alt="Shaded world map viewer on a saved Simcountry world render" src="readmescreenshots/Screenshot_20261009_164146.png">
+
+*Shaded world map viewer on a saved Simcountry world render.*
+
+### Snapshots
+
+- [Fearless Blue](World%20Maps/simcountry-fearless-blue-world-20261009-0556.html) — `sim02`, saved 05:56
+- [White Giant](World%20Maps/simcountry-white-giant-world-20261009-0549.html) — `sim03`, saved 05:49
+- [Golden Rainbow](World%20Maps/simcountry-golden-rainbow-world-20261009-0544.html) — `sim04`, saved 05:44
+- [Kebir Blue](World%20Maps/simcountry-kebir-blue-world-20261009-0600.html) — `sim01`, saved 06:00
+- [Little Upsilon](World%20Maps/simcountry-little-upsilon-world-20261009-0604.html) — `sim05`, saved 06:04
+- [Tiny Atlas](World%20Maps/simcountry-tiny-atlas-world-20261009-0607.html) — `sim06`, saved 06:07
+
+### How to use
+
+- Download the HTML file (GitHub's raw view is fine) and open it in a browser. No server, no login.
+- **− / +**, **Fit**, and **100%** set the zoom. Ctrl+wheel does the same.
+- The search box is "Find country / number / president".
+- The side panel lists world, game date, host, build time, how many countries were traced, and regions. Continents and regions are buttons.
+- The status line is the snapshot: world, in-game date, country and region counts, and when it was saved.
+- These pages are finished outputs. See License. They are not covered by the Unlicense.
+
+---
+
 ## Repository layout
 
 ```
@@ -227,8 +263,17 @@ Simcountry/
 │   ├── LoanOffersjs Example Screenshot.png
 │   ├── Portaljs Example Screenshot.png
 │   ├── Salary Toolbox SS.png
+│   ├── Screenshot_20261009_164146.png
 │   ├── SS Cash Log.png
 │   └── placeholder
+├── World Maps/
+│   ├── placeholder
+│   ├── simcountry-fearless-blue-world-20261009-0556.html
+│   ├── simcountry-golden-rainbow-world-20261009-0544.html
+│   ├── simcountry-kebir-blue-world-20261009-0600.html
+│   ├── simcountry-little-upsilon-world-20261009-0604.html
+│   ├── simcountry-tiny-atlas-world-20261009-0607.html
+│   └── simcountry-white-giant-world-20261009-0549.html
 ├── 3rd Party/
 │   └── War Casualty Bookmarklet.txt
 ├── External Tools/
@@ -249,15 +294,16 @@ Simcountry/
 - Portal sort order is local to that browser. It will not follow you to another machine.
 - Cash Log paints on the finance cash tab. The same script also paints on trade sales (`tsl`) and purchases (`tbl`). Load older follows a next link already in the response — the cash-log applet link, or the trade Next control — and stops at the row cap (default 1000). It does not invent page parameters.
 - `External Tools/csv-viewer.html` opens a local CSV in the browser. Caps, sort, filter, and find/replace stay on that page. The original file is not changed until you export.
+- World-map HTML files are offline snapshots under `World Maps/`. Opening one does not fetch the game. `World Maps/` has no license file of its own, so those renders stay proprietary.
 - Unofficial tools can sit in a grey area of a game's rules. If Simcountry says no, stop.
 
 ---
 
 ## License
 
-[The Unlicense](LICENSE) — public domain.
+The Unlicense covers the tools in this repo: the userscripts, the bookmarklet, and `External Tools/csv-viewer.html`. Copy, modify, ship, or ignore those with or without credit. They are provided **as is**, without warranty of any kind. They may work. They may not. They will not reimburse you for a bad loan book.
 
-Copy, modify, ship, or ignore with or without credit. The software is provided **as is**, without warranty of any kind. It may work. It may not. It will not reimburse you for a bad loan book.
+That grant stops at the tools. [LICENSE](LICENSE) now says finished outputs posted here are not automatically Unlicense. Mapping outputs, renders, applets, and web pages — including the shaded world maps — are proprietary unless a license file sits in their directory. `World Maps/` has no such file. Do not copy those renders out as if they were public domain.
 
 ---
 
