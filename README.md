@@ -48,8 +48,7 @@ Preferences are stored in Tampermonkey / `localStorage`. They stay on your machi
 
 The stock loan page is a form plus a flat list. This script keeps the native submit path and layers a small toolkit on top of it.
 
-<img style="max-width:100%;height:auto;" alt="Loan Offers toolkit on the loan-offer page" src="readmescreenshots/LoanOffersjs%20Example%20Screenshot.png">
-
+![Loan Offers toolkit on the loan-offer page](readmescreenshots/LoanOffersjs%20Example%20Screenshot.png)
 *Loan Offers toolkit on the loan-offer page.*
 
 ### Features
@@ -108,8 +107,7 @@ Nothing is sent until you hit the site's own save button.
 
 Same idea as the order-strategy toolbox, pointed at the state salary grid. Checkboxes select corporations. Sorting and filters only reflow the live list. Apply writes the form fields; the site button **Set Salary Changes** is what actually saves.
 
-<img style="max-width:100%;height:auto;" alt="Salary Tweaks toolbox on the salary-levels page" src="readmescreenshots/Salary%20Toolbox%20SS.png">
-
+![Salary Tweaks toolbox on the salary-levels page](readmescreenshots/Salary%20Toolbox%20SS.png)
 *Salary Tweaks toolbox on the salary-levels page.*
 
 ### Features
@@ -141,8 +139,7 @@ Nothing is sent until you hit **Set Salary Changes**.
 
 Drag the country and enterprise tiles into the order you actually use, or pick a named sort. The ticker can be grabbed and flung instead of only auto-scrolling.
 
-<img style="max-width:100%;height:auto;" alt="Portal desktop enhancer on the portal page" src="readmescreenshots/Portaljs%20Example%20Screenshot.png">
-
+![Portal desktop enhancer on the portal page](readmescreenshots/Portaljs%20Example%20Screenshot.png)
 *Portal desktop enhancer on the portal page.*
 
 ### Widget features
@@ -178,8 +175,7 @@ Order and ticker prefs live in `localStorage` under `scEnhancer.v1`. From the co
 
 Cash Log is not its own page. The script reads that applet payload, drops empty spacer and history-icon columns, and paints a second table of the text columns. Sales and purchase pages get the same panel on their own tables. It does not invent page parameters, and it leaves profit & loss and year-to-date alone.
 
-<img style="max-width:100%;height:auto;" alt="Cash Log toolkit on the cash-log page" src="readmescreenshots/SS%20Cash%20Log.png">
-
+![Cash Log toolkit on the cash-log page](readmescreenshots/SS%20Cash%20Log.png)
 *Cash Log toolkit on the cash-log page.*
 
 ### Features
@@ -225,8 +221,7 @@ Screenshot: none yet.
 
 Each file is a shaded whole-world map from the morning of 9 Oct 2026 (Central). Download the HTML and open it locally. The page draws the map, a zoom bar, and a side panel. Search matches country name, country number, or president. Continent and region buttons jump the view. Hover a country for the tip. Dashed boxes are regions placed approximately.
 
-<img style="max-width:100%;height:auto;" alt="Shaded world map viewer on a saved Simcountry world render" src="readmescreenshots/Screenshot_20261009_164146.png">
-
+![Shaded world map viewer on a saved Simcountry world render](readmescreenshots/Screenshot_20261009_164146.png)
 *Shaded world map viewer on a saved Simcountry world render.*
 
 ### Snapshots
