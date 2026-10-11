@@ -83,6 +83,8 @@ Galaxy Console (formerly Galaxy+) is a full CentauDos viewer and console. It bui
 
 Nothing is written until you enable the relevant switches and confirm each action. The original game pages are only read (plus the added launcher button).
 
+Full usage guide: [Galaxy Console.md](Galaxy%20Console.md).
+
 ---
 
 ## World maps
