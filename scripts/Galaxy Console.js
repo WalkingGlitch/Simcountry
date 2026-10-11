@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simcountry Galaxy Console
 // @namespace    https://simcountry.com/galaxy-plus
-// @version      3.0.7
+// @version      3.1.6
 // @description  Galaxy Console (formerly Galaxy+): CentauDos viewer and console. Shuttle register + event log (IndexedDB, CSV in/out), shuttle/station/market/docking lists, shuttle flights, rename and bulk rename, transport requests (writes OFF by default, each confirmed).
 // @author       TheWalkingGlitch
 // @match        https://www.simcountry.com/cgi-bin/cgi2nova*
@@ -12,7 +12,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  const VERSION = '3.0.7';
+  const VERSION = '3.1.6';
   const W = window;
 
   /* ===================================================================
@@ -25,7 +25,7 @@
     NET_LOG_RING: 2000,          // request log entries inside the RequestClient
     PAGE_CACHE_LRU: 60,          // parsed server pages (station info, docks...) kept in memory
     SHIP_LOGBOOK_LINES: 200,     // logbook lines parsed per shuttle detail read
-    SHIP_LOGBOOK_KEEP: 1000,     // accumulated logbook lines kept per shuttle in the register (union of all reads)
+    SHIP_LOGBOOK_KEEP: 10000000, /* 3.1.6: keep all lines (global logbook budget is the only limit) */     // accumulated logbook lines kept per shuttle in the register (union of all reads)
     VTABLE_OVERSCAN: 30,         // extra rows rendered above/below the visible window
     VTABLE_ROW_PX: 22,           // fixed row height of virtual tables
     IDB_BATCH: 500,              // max records per IndexedDB write transaction
@@ -56,25 +56,70 @@
    * DEBUG LOG: two channels (net, script), ring buffer, level filter.
    * =================================================================== */
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+  /* ---------- 3.1.5 memory safeguards: size estimates, per-entry caps, byte budgets (see ARCHITECTURE §0f) ---------- */
+  const MEM = Object.freeze({
+    DEBUG_BYTES: 500 * 1048576, DEBUG_BYTES_MIN: 5 * 1048576, DEBUG_BYTES_MAX: 4096 * 1048576, /* 3.1.6: generous last-resort caps */   // debug log byte budget (Developer settings)
+    ENTRY_MSG: 65536, ENTRY_DATA: 262144,                                                          // per debug entry: message / data text (chars)
+    EVENT_BYTES: 2048 * 1048576, EVENT_BYTES_MIN: 20 * 1048576, EVENT_BYTES_MAX: 8192 * 1048576, // events in memory byte budget
+    EVENT_FIELD: 16384,                                                                           // per event string field (chars)
+    LOGBOOK_BYTES: 1024 * 1048576,                                                                 // all shuttles' accumulated logbooks in the register
+    LOGBOOK_MIN_KEEP: 100,                                                                       // logbook lines per shuttle never trimmed below this
+    PAGE_CACHE_BYTES: 256 * 1048576,                                                              // parsed-page LRU
+    SHIPLOG_CACHE: 2000,                                                                          // shuttles whose parsed logbook tab rows are cached
+    MKHIST_POINTS: 1000000,                                                                        // market quantity history points (all products × stations)
+    CAPTURE_ITEM: 1048576,                                                                         // one form-capture item (chars of JSON)
+    TREND_KEYS: 50000,                                                                            // keys per trends hour bucket and dimension
+    WATCH_MS: 60000, HEAP_WARN: 0.9                                                             // watchdog period; JS heap share that triggers trimming
+  });
+  /** rough size in bytes of a JS value (UTF-16 strings, 8-byte numbers, object/array overhead); bounded walk */
+  function estBytes(v, budget) {
+    let n = 0, nodes = 0; const max = budget || 20000, seen = new Set();
+    const walk = x => { if (++nodes > max) return; if (x == null) { n += 8; return; } const t = typeof x;
+      if (t === 'string') { n += 40 + 2 * x.length; return; } if (t === 'number' || t === 'boolean') { n += 8; return; } if (t !== 'object' || seen.has(x)) return; seen.add(x);
+      if (Array.isArray(x)) { n += 32 + 8 * x.length; for (const y of x) walk(y); return; } if (x instanceof Map) { n += 64 + 40 * x.size; for (const [k, y] of x) { walk(k); walk(y); } return; }
+      const ks = Object.keys(x); n += 48 + 16 * ks.length; for (const k of ks) walk(x[k]); };
+    walk(v); return n;
+  }
+  const capStr = (s, n) => { s = String(s); return s.length > n ? s.slice(0, n) + `…[truncated ${s.length - n} chars]` : s; };
   function createDebug() {
-    const ring = []; let seq = 0; const subs = new Set(); let minLevel = 'debug';
+    const ring = []; let seq = 0; let cap = LIMITS.DEBUG_RING; /* 3.0.8: adjustable (Settings > Developer) */ const subs = new Set(); let minLevel = 'debug';
+    let bytes = 0, budget = MEM.DEBUG_BYTES, trimmedBytes = 0, truncated = 0, warned = false, onBudget = null;
+    /* 3.1.5: entries keep TEXT only (message ≤ 4 KB, data as JSON ≤ 16 KB, truncated with a marker) so no response body or live object is pinned;
+     * trimming is by row count AND by estimated bytes (budget), amortised (batch of ≥ 5 %). */
+    const entryBytes = e => 120 + 2 * (e.msg.length + (e.dataText ? e.dataText.length : 0));
+    const trim = force => { let drop = 0; if (ring.length - cap >= (force ? 1 : Math.max(200, cap * 0.05))) drop = ring.length - cap;
+      if (bytes > budget) { let b = bytes, i = 0; const goal = budget * 0.9; while (i < ring.length && b > goal) { b -= ring[i].b; i++; } drop = Math.max(drop, i);
+        if (!warned) { warned = true; if (onBudget) try { onBudget(); } catch (e) { /* */ } } }
+      if (drop > 0) { const gone = ring.splice(0, drop); let gb = 0; for (const g of gone) gb += g.b; bytes -= gb; trimmedBytes += gb; } };
     const add = (channel, level, msg, data) => {
       if (LEVELS[level] < LEVELS[minLevel]) return;
-      ring.push({ n: ++seq, t: Date.now(), channel, level, msg, data: data === undefined ? undefined : data });
-      if (ring.length > LIMITS.DEBUG_RING) ring.splice(0, ring.length - LIMITS.DEBUG_RING);
+      let m = String(msg), dt; if (m.length > MEM.ENTRY_MSG) { m = capStr(m, MEM.ENTRY_MSG); truncated++; }
+      if (data !== undefined) { dt = typeof data === 'string' ? JSON.stringify(data.length > MEM.ENTRY_DATA ? capStr(data, MEM.ENTRY_DATA) : data) : safeJson(data, MEM.ENTRY_DATA); if (dt.length > MEM.ENTRY_DATA) { dt = capStr(dt, MEM.ENTRY_DATA); truncated++; } }
+      const e = { n: ++seq, t: Date.now(), channel, level, msg: m, dataText: dt }; e.b = entryBytes(e); bytes += e.b;
+      ring.push(e); trim(false); // 3.0.9: batch trim (amortised O(1)); 3.1.5: + byte budget
       for (const f of subs) { try { f(); } catch (e) { /* */ } }
     };
     const api = {
+      setLimit: n => { cap = Math.max(1000, Math.min(100000, Math.round(+n) || LIMITS.DEBUG_RING)); trim(true); for (const f of subs) { try { f(); } catch (e) { /* */ } } return cap; },
+      limit: () => cap, size: () => Math.min(ring.length, cap),
+      setByteBudget: n => { budget = Math.max(MEM.DEBUG_BYTES_MIN, Math.min(MEM.DEBUG_BYTES_MAX, Math.round(+n) || MEM.DEBUG_BYTES)); warned = false; trim(true); return budget; },
+      byteBudget: () => budget, bytes: () => bytes, onBudget: f => { onBudget = f; }, minLevel: () => minLevel,
+      stats: () => ({ rows: ring.length, bytes, budget, trimmedBytes, truncated, minLevel }),
+      trimTo: frac => { const goal = budget * frac; let i = 0, b = bytes; while (i < ring.length && b > goal) { b -= ring[i].b; i++; } if (i) { const gone = ring.splice(0, i); for (const g of gone) { bytes -= g.b; trimmedBytes += g.b; } } return i; },
+      reset: () => { const n = ring.length; ring.length = 0; bytes = 0; warned = false; for (const f of subs) { try { f(); } catch (e) { /* */ } } add('script', 'info', `debug log reset (${n} rows cleared)`); return n; },
       net: (level, msg, data) => add('net', level, msg, data),
       script: (level, msg, data) => add('script', level, msg, data),
-      entries: (channel, level) => ring.filter(e => (!channel || channel === 'all' || e.channel === channel) && LEVELS[e.level] >= LEVELS[level || 'debug']),
+      entries: (channel, level) => (ring.length > cap ? ring.slice(-cap) : ring).filter(e => (!channel || channel === 'all' || e.channel === channel) && LEVELS[e.level] >= LEVELS[level || 'debug']),
       setMinLevel: l => { minLevel = l; }, subscribe: f => { subs.add(f); return () => subs.delete(f); },
-      toText: (channel, level) => api.entries(channel, level).map(e => `${new Date(e.t).toISOString()} [${e.channel}] ${e.level.toUpperCase()} ${e.msg}${e.data !== undefined ? ' ' + safeJson(e.data) : ''}`).join('\n'),
-      size: () => ring.length,
+      toText: (channel, level) => api.entries(channel, level).map(dbgLine).join('\n'),
+      /** 3.1.5: streamed text (chunks of ≤ 2,000 lines) for copy/export without one giant intermediate array of strings */
+      textChunks: function* (channel, level, last) { let L = api.entries(channel, level); if (last) L = L.slice(-last); for (let i = 0; i < L.length; i += 2000) yield L.slice(i, i + 2000).map(dbgLine).join('\n'); },
     };
     return api;
   }
-  const safeJson = v => { try { return JSON.stringify(v); } catch (e) { return String(v); } };
+  const dbgLine = e => `${new Date(e.t).toISOString()} [${e.channel}] ${e.level.toUpperCase()} ${e.msg}${e.dataText !== undefined ? ' ' + e.dataText : ''}`;
+  /** JSON text; with max: never builds more than ~max chars for big strings inside (they are cut first) */
+  const safeJson = (v, max) => { try { if (!max) return JSON.stringify(v); return JSON.stringify(v, (k, x) => typeof x === 'string' && x.length > max ? capStr(x, Math.max(256, max >> 2)) : x); } catch (e) { return String(v); } };
 
   /* ===================================================================
    * STRICT ALLOWLISTS
@@ -657,10 +702,12 @@
    * SMALL UTILITIES: LRU, CSV
    * =================================================================== */
   class LRU {
-    constructor(max) { this.max = max; this.m = new Map(); }
+    constructor(max, maxBytes) { this.max = max; this.m = new Map(); this.maxBytes = maxBytes || 0; this.bytes = 0; this.b = new Map(); } // 3.1.5: optional byte budget
     get(k) { if (!this.m.has(k)) return undefined; const v = this.m.get(k); this.m.delete(k); this.m.set(k, v); return v; }
-    set(k, v) { this.m.delete(k); this.m.set(k, v); while (this.m.size > this.max) this.m.delete(this.m.keys().next().value); return v; }
-    get size() { return this.m.size; } clear() { this.m.clear(); }
+    _del(k) { this.bytes -= this.b.get(k) || 0; this.b.delete(k); this.m.delete(k); }
+    set(k, v) { if (this.m.has(k)) this._del(k); this.m.set(k, v); if (this.maxBytes) { const n = estBytes(v, 50000); this.b.set(k, n); this.bytes += n; }
+      while (this.m.size > this.max || (this.maxBytes && this.bytes > this.maxBytes && this.m.size > 1)) this._del(this.m.keys().next().value); return v; }
+    get size() { return this.m.size; } clear() { this.m.clear(); this.b.clear(); this.bytes = 0; }
   }
   const CSV_COLUMNS = Object.freeze(['record_type', 'ship_id', 'name', 'owner', 'location', 'destination', 'cargo', 'missions', 'since_tu', 'arrival_tu', 'status',
     'x', 'y', 'on_map', 'first_seen', 'last_seen', 'last_seen_session', 'detail_at', 'event_time', 'field', 'old_value', 'new_value', 'source']);
@@ -820,20 +867,26 @@
   }
   /* ===================================================================
    * STORAGE: IndexedDB (cursor reads, batched writes) with in-memory fallback
-   * stores: ships{id}, events{dk = dedupe key; index t}, meta{key}, queue{qid}
+   * stores: ships{id}, events{dk = dedupe key; index t}, meta{key}, queue{qid}, dict{c} (3.1.0, DB version 2)
+   * 3.1.0 compact event records: repeated strings are interned into 'dict' ({ c: <number>, s: <string> });
+   * a compact record carries v:2 and short keys (see packEvent). Old records (no v) stay readable, so the
+   * migration can run in the background, resumably, and a half-migrated store is always valid.
    * =================================================================== */
   const reqP = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const txDone = tx => new Promise((res, rej) => { tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('tx abort')); });
   class GxDB {
     constructor(idb, name) { this.idb = idb; this.name = name || 'galaxyplus'; this.db = null; }
     async open() {
-      const r = this.idb.open(this.name, 1);
-      r.onupgradeneeded = () => {
-        const d = r.result;
-        d.createObjectStore('ships', { keyPath: 'id' });
-        d.createObjectStore('events', { keyPath: 'dk' }).createIndex('t', 't');
-        d.createObjectStore('meta', { keyPath: 'key' });
-        d.createObjectStore('queue', { keyPath: 'qid' });
+      const r = this.idb.open(this.name, 2);
+      r.onupgradeneeded = ev => {
+        const d = r.result, old = ev.oldVersion || 0;
+        if (old < 1) {
+          d.createObjectStore('ships', { keyPath: 'id' });
+          d.createObjectStore('events', { keyPath: 'dk' }).createIndex('t', 't');
+          d.createObjectStore('meta', { keyPath: 'key' });
+          d.createObjectStore('queue', { keyPath: 'qid' });
+        }
+        if (old < 2 && !d.objectStoreNames.contains('dict')) d.createObjectStore('dict', { keyPath: 'c' }); // 3.1.0: string dictionary
       };
       this.db = await reqP(r); return this;
     }
@@ -846,6 +899,23 @@
         c.onsuccess = () => { const cur = c.result; if (!cur || (opts.limit && n >= opts.limit)) return res(); n++; if (cb(cur.value) === false) return res(); cur.continue(); };
         c.onerror = () => rej(c.error);
       });
+    }
+    /** 3.1.0: read 'events' in time order in batches; each batch in its own short transaction, so `cb` may await.
+     *  `from` = { t, dks } resume point (records with t === from.t whose dk is in dks were already handed out). */
+    async eachBatch(store, size, cb, from) {
+      let lastT = from ? from.t : null, seen = new Set(from ? from.dks || [] : []);
+      for (;;) {
+        const batch = []; const tx = this.db.transaction(store, 'readonly'); const ix = tx.objectStore(store).index('t');
+        await new Promise((res, rej) => {
+          const c = ix.openCursor(lastT == null ? null : (this.KeyRange || W.IDBKeyRange || IDBKeyRange).lowerBound(lastT));
+          c.onsuccess = () => { const cur = c.result; if (!cur || batch.length >= size) return res(); const v = cur.value; if (!(v.t === lastT && seen.has(v.dk))) batch.push(v); cur.continue(); };
+          c.onerror = () => rej(c.error);
+        });
+        if (!batch.length) return;
+        const lt = batch[batch.length - 1].t; if (lt !== lastT) seen = new Set(); lastT = lt; for (const v of batch) if (v.t === lt) seen.add(v.dk);
+        if ((await cb(batch, { t: lastT, dks: [...seen] })) === false) return;
+        if (batch.length < size) return;
+      }
     }
     async putMany(store, items) {
       for (let i = 0; i < items.length; i += LIMITS.IDB_BATCH) {
@@ -864,7 +934,10 @@
     async setMeta(key, value) { await this.putMany('meta', [{ key, value }]); }
   }
   class MemDB { // fallback when IndexedDB is unavailable (nothing persists)
-    constructor() { this.s = { ships: new Map(), events: new Map(), meta: new Map(), queue: new Map() }; this.kp = { ships: 'id', events: 'dk', meta: 'key', queue: 'qid' }; }
+    constructor() { this.s = { ships: new Map(), events: new Map(), meta: new Map(), queue: new Map(), dict: new Map() }; this.kp = { ships: 'id', events: 'dk', meta: 'key', queue: 'qid', dict: 'c' }; }
+    async eachBatch(store, size, cb, from) { const v = [...this.s[store].values()].sort((a, b) => (a.t - b.t) || (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0));
+      let i = 0; if (from) { while (i < v.length && (v[i].t < from.t || (v[i].t === from.t && (from.dks || []).indexOf(v[i].dk) >= 0))) i++; }
+      for (; i < v.length; i += size) { const b = v.slice(i, i + size).map(x => JSON.parse(JSON.stringify(x))); const lt = b[b.length - 1].t; if ((await cb(b, { t: lt, dks: b.filter(x => x.t === lt).map(x => x.dk) })) === false) return; } }
     async open() { return this; } close() {}
     async eachRecord(store, cb, o) { let v = [...this.s[store].values()]; if (o && o.index === 't') v.sort((a, b) => a.t - b.t); if (o && o.dir === 'prev') v.reverse(); let n = 0; for (const x of v) { if (o && o.limit && n++ >= o.limit) break; if (cb(x) === false) break; } }
     async putMany(store, items) { for (const it of items) this.s[store].set(it[this.kp[store]], JSON.parse(JSON.stringify(it))); }
@@ -896,12 +969,67 @@
     const emit = () => { for (const f of T.listeners) { try { f(); } catch (e) { dbg.script('error', 'listener: ' + e.message); } } };
     function blank(id) { return { id, name: '', owner: '', location: '', destination: '', cargo: null, missions: null, sinceTu: null, arrivalTu: null, status: 'unknown', x: null, y: null, ownerKey: '', firstDetailAt: 0, logSeq: 0, logbook: [],
       onMap: false, heading: null, firstSeen: now(), lastSeen: 0, lastSeenSession: 0, detailAt: 0, inList: false, stale: false, detail: null, detailError: null, nextDueAt: 0, snap: null }; }
+    /* 3.0.8: optional per-type filter (Settings > Events). Unchecked types are not recorded from now on; ship data,
+     * logbooks and already stored events are untouched. */
+    T.eventFilter = null;
+    /* 3.0.8: rows kept in the in-memory events log (Events tab, trends, notifications). The IndexedDB register itself is not trimmed. */
+    T.eventLimit = LIMITS.EVENT_RING_UI;
+    /* 3.0.9: amortised trimming. Before, every add past the limit did splice(0, 1) on a 20,000-element array (O(n) per
+     * add). Now the oldest rows are dropped in one batch once the log is a margin (5 %, >= 200) over the limit, so the
+     * cost per add is O(1) amortised; the newest rows are always kept. */
+    /* 3.1.1: with auto-export on, the margin is the export batch (1,000 when the limit is <= 10,000, else 10,000): the log may hold
+     * limit + batch rows, and each trim drops exactly one batch, which is exactly what gets exported. */
+    T.autoExport = false; T.rollBatch = () => (T.eventLimit <= 10000 ? 1000 : 10000);
+    const evMargin = () => (T.autoExport ? T.rollBatch() : Math.max(200, Math.round(T.eventLimit * 0.05)));
+    /* 3.1.5: byte budget for the in-memory events (estimated; string fields capped at MEM.EVENT_FIELD chars on add) */
+    T.eventBytes = MEM.EVENT_BYTES; T.evBytes = 0; T.evByteTrims = 0; T.onBudget = null;
+    const evB = e => { let n = 160; for (const k in e) { const v = e[k]; n += 16 + (typeof v === 'string' ? 2 * v.length : 8); } return n; };
+    const capEv = e => { for (const k in e) { const v = e[k]; if (typeof v === 'string' && v.length > MEM.EVENT_FIELD && k !== 'dk') e[k] = capStr(v, MEM.EVENT_FIELD); } return e; };
+    /* 3.1.5: accumulated logbooks of all shuttles: estimated bytes and a global trim (oldest lines of the longest logbooks first, never below MEM.LOGBOOK_MIN_KEEP lines) */
+    const lbB = l => 120 + 2 * ((l.text || '').length + (l.when || '').length);
+    T.logbookBytes = () => { let n = 0; for (const s of T.ships.values()) for (const l of s.logbook || []) n += lbB(l); return n; };
+    T.trimLogbooks = budget => { let total = T.logbookBytes(); if (total <= budget) return 0; let cut = 0; const goal = budget * 0.9;
+      const list = [...T.ships.values()].filter(s => s.logbook && s.logbook.length > MEM.LOGBOOK_MIN_KEEP).sort((a, b) => b.logbook.length - a.logbook.length);
+      for (let round = 0; round < 8 && total > goal && list.length; round++) for (const s of list) { if (total <= goal) break; const L = s.logbook, keep = Math.max(MEM.LOGBOOK_MIN_KEEP, Math.floor(L.length * 0.75)); if (L.length <= keep) continue;
+        const gone = L.splice(0, L.length - keep); for (const g of gone) total -= lbB(g); cut += gone.length; }
+      return cut; };
+    T.recountEvents = () => { let n = 0; for (const e of T.events) n += evB(e); T.evBytes = n; return n; };
+    function addEv(e) { capEv(e); T.evBytes += evB(e); T.events.push(e); }
+    function trimEvents(force) {
+      if (force) T.recountEvents();
+      let over = T.events.length - T.eventLimit; if (!(over > 0 && (force || over >= evMargin()))) over = 0;
+      if (T.evBytes > T.eventBytes) { let b = T.evBytes, i = 0; const goal = T.eventBytes * 0.9; while (i < T.events.length && b > goal) { b -= evB(T.events[i]); i++; } if (i > over) { over = i; T.evByteTrims++; if (T.onBudget) { try { T.onBudget(i); } catch (x) { /* */ } } } }
+      if (over > 0) { const gone = T.events.splice(0, over); let gb = 0; for (const g of gone) gb += evB(g); T.evBytes = Math.max(0, T.evBytes - gb); if (T.onTrim) { try { T.onTrim(gone); } catch (e) { dbg.script('error', 'trim hook: ' + e.message); } } } }
+    /* 3.1.0: T.onTrim(rows) is called with exactly the rows dropped from the in-memory log (oldest first) — used by the
+     * auto-export on rollover, so consecutive files neither overlap nor leave gaps. */
+    T.onTrim = null;
+    T.trimEvents = trimEvents;
+    /** 3.0.9: clear the in-memory events log (Events tab view). The stored register / events CSV history is NOT deleted. */
+    T.resetEvents = () => { const n = T.events.length; T.events.length = 0; T.evBytes = 0; dbg.script('info', `events log view reset (${n} rows cleared from memory; saved history kept)`); emit(); return n; };
+    T.setEventLimit = n => { T.eventLimit = Math.max(1000, Math.min(200000, Math.round(+n) || LIMITS.EVENT_RING_UI)); trimEvents(true); emit(); return T.eventLimit; };
+    /* 3.1.0 events logging mode: 'standard' (per-type selection) or 'compact' (trip/cargo facts only: departure with
+     * origin + destination, arrival, cargo type/quantity, real time + the game's tu counter; for all shuttles). */
+    T.mode = 'standard'; T.loggingOn = true;
+    const COMPACT_FIELDS = new Set(['trip_start', 'arrived', 'cargo_load', 'cargo_unload']);
+    const lastPlace = new Map(); // ship -> last arrival place (origin of the next departure)
     function pushEvent(s, field, from, to, source, t, extra) {
+      if (field === 'arrived' && extra && extra.place) lastPlace.set(s.id, extra.place);
+      const off = !T.loggingOn || (T.mode === 'compact' ? !COMPACT_FIELDS.has(field) : (T.eventFilter && !T.eventFilter(field)));
+      if (off) { if (field !== 'registered' && field !== 'onMap') s.lastChangeAt = t || now(); return; }
+      if (T.mode === 'compact') {
+        const x = extra || {}, e = { t: t || now(), ship: s.id, name: s.name, owner: s.owner, field, from: field === 'trip_start' ? (lastPlace.get(s.id) || '') : '', to: field === 'trip_start' ? (x.place || '') : '', source, compact: 1,
+          lk: x.lk, server: x.server, st: x.st, seq: x.seq, product: x.product || '', qty: x.qty == null ? '' : x.qty, unit: x.unit || '', place: x.place || '', tu: s.sinceTu == null ? '' : s.sinceTu };
+        e.dk = e.lk ? ['L', e.ship, e.lk].join('|') : [e.t, e.ship, e.field, e.from, e.to].join('|');
+        s.lastChangeAt = e.t; addEv(e); trimEvents(); T.pendingEvents.push(e);
+        for (const f of T.eventHooks) { try { f(e); } catch (x2) { dbg.script('error', 'event hook: ' + x2.message); } }
+        return;
+      }
+      if (T.eventFilter && !T.eventFilter(field)) { if (field !== 'registered' && field !== 'onMap') s.lastChangeAt = t || now(); return; } // 3.0.10: filtered changes still mark the shuttle active (refresh cadence)
       const e = { t: t || now(), ship: s.id, name: s.name, owner: s.owner, field, from: from == null ? '' : String(from), to: to == null ? '' : String(to), source };
       if (extra) Object.assign(e, extra);
       e.dk = e.lk ? ['L', e.ship, e.lk].join('|') : [e.t, e.ship, e.field, e.from, e.to].join('|');
       if (field !== 'registered' && field !== 'onMap') s.lastChangeAt = e.t;
-      T.events.push(e); if (T.events.length > LIMITS.EVENT_RING_UI) T.events.splice(0, T.events.length - LIMITS.EVENT_RING_UI);
+      addEv(e); trimEvents();
       T.pendingEvents.push(e);
       for (const f of T.eventHooks) { try { f(e); } catch (x) { dbg.script('error', 'event hook: ' + x.message); } }
     }
@@ -982,12 +1110,54 @@
       T.lastTickSeen = seenIds;
     };
     T.listLoaded = ids => { for (const s of T.ships.values()) if (s.inList && !ids.has(s.id)) T.observe(s.id, { inList: false }, 'list-missing'); T.lastListIds = ids; };
+    /* ---------- 3.1.0 compact stored events (string dictionary) ---------- */
+    const dict = { s2c: new Map(), c2s: [], pending: [] };
+    const intern = v => { if (v == null || v === '') return v; v = String(v); let c = dict.s2c.get(v); if (c == null) { c = dict.c2s.length; dict.c2s.push(v); dict.s2c.set(v, c); dict.pending.push({ c, s: v }); } return c; };
+    const deref = c => (c == null || c === '' ? '' : typeof c === 'number' ? (dict.c2s[c] == null ? '' : dict.c2s[c]) : c);
+    const INTERN_FT = new Set(['location', 'destination', 'status', 'trip_start']); // from/to values that repeat
+    /** stored form: v:2, short keys, interned strings. t, dk, ship, lk, seq, st, qty, server, tu stay as they are. */
+    function packEvent(e) {
+      if (e.v === 2) return e;
+      const r = { v: 2, dk: e.dk, t: e.t, ship: e.ship, f: intern(e.field), so: intern(e.source) };
+      if (e.name) r.n = intern(e.name); if (e.owner) r.o = intern(e.owner);
+      if (e.from) r.a = INTERN_FT.has(e.field) ? intern(e.from) : e.from; if (e.to) r.b = INTERN_FT.has(e.field) ? intern(e.to) : e.to;
+      if (e.place) r.p = intern(e.place); if (e.product) r.pr = intern(e.product); if (e.unit) r.u = intern(e.unit);
+      for (const k of ['lk', 'server', 'st', 'seq', 'note', 'tu', 'compact']) if (e[k] != null && e[k] !== '') r[k] = e[k];
+      if (e.qty != null && e.qty !== '') r.q = e.qty;
+      return r;
+    }
+    function unpackEvent(r) {
+      if (!r || r.v !== 2) return r;
+      const e = { t: r.t, dk: r.dk, ship: r.ship, field: deref(r.f), source: deref(r.so), name: deref(r.n), owner: deref(r.o), from: deref(r.a), to: deref(r.b), place: deref(r.p), product: deref(r.pr), unit: deref(r.u), qty: r.q == null ? '' : r.q };
+      for (const k of ['lk', 'server', 'st', 'seq', 'note', 'tu', 'compact']) if (r[k] != null) e[k] = r[k];
+      return e;
+    }
+    T.packEvent = packEvent; T.unpackEvent = unpackEvent; T.dictSize = () => dict.c2s.length;
+    const flushDict = async () => { if (!dict.pending.length) return; const p = dict.pending.splice(0); try { await db.putMany('dict', p); } catch (e) { dict.pending.unshift(...p); throw e; } };
+    /** 3.1.0 migration of stored events to the compact form: batches of 500 in time order, progress saved after every batch
+     *  (meta 'migV2'), so it resumes after a reload; packing an already-compact record is a no-op (idempotent). */
+    T.migration = { state: 'idle', done: 0, total: 0 };
+    T.migrateV2 = async (opts) => {
+      opts = opts || {}; const st = await db.getMeta('migV2', null); if (st && st.done) { T.migration = { state: 'done', done: st.n || 0, total: st.n || 0 }; return T.migration; }
+      if (!db.eachBatch) return T.migration;
+      T.migration = { state: 'running', done: st ? st.n || 0 : 0, total: await db.count('events') }; emit();
+      let n = st ? st.n || 0 : 0, from = st ? st.from : null;
+      await db.eachBatch('events', opts.batch || 500, async (batch, pos) => {
+        const todo = batch.filter(r => r.v !== 2).map(packEvent);
+        await flushDict(); if (todo.length) await db.putMany('events', todo);
+        n += batch.length; from = pos; await db.setMeta('migV2', { done: false, n, from });
+        T.migration.done = n; emit(); if (opts.onProgress) opts.onProgress(T.migration);
+        if (opts.stopAfter && n >= opts.stopAfter) return false; // tests: simulate an interrupted run
+      }, from);
+      if (opts.stopAfter && n >= opts.stopAfter && n < T.migration.total) { T.migration.state = 'paused'; return T.migration; }
+      await db.setMeta('migV2', { done: true, n }); T.migration = { state: 'done', done: n, total: n }; dbg.script('info', `events storage: ${n} records in compact form`); emit(); return T.migration;
+    };
     const toRecord = s => { const r = {}; for (const k of SHIP_FIELDS) r[k] = s[k]; r.snap = s.snap; r.detailLite = s.detail ? Object.assign({}, s.detail) : null; r.logbook = s.logbook || []; return r; };
     T.flush = async () => {
       const ids = [...T.dirty]; T.dirty.clear(); const ev = T.pendingEvents.splice(0);
       try {
         if (ids.length) await db.putMany('ships', ids.map(id => T.ships.get(id)).filter(Boolean).map(toRecord));
-        if (ev.length) await db.putMany('events', ev);
+        if (ev.length) { const packed = ev.map(packEvent); await flushDict(); await db.putMany('events', packed); }
         if (T.capacityDirty) { T.capacityDirty = false; await db.setMeta('capacity', [...T.capacity.entries()]); }
         if (ids.length || ev.length) dbg.script('debug', `cache flush: ${ids.length} ships, ${ev.length} events`);
       } catch (e) { dbg.script('error', 'cache flush failed: ' + e.message); for (const id of ids) T.dirty.add(id); T.pendingEvents.unshift(...ev); }
@@ -997,8 +1167,9 @@
       T.capacity = new Map(await db.getMeta('capacity', []));
       let n = 0;
       await db.eachRecord('ships', r => { const s = Object.assign(blank(r.id), r); s.detail = r.detailLite ? Object.assign({ logs: [] }, r.detailLite) : null; s.logbook = r.logbook || []; for (const l of s.logbook) if (!l.tz) { l.st = serverStamp(l.when, l.seenAt) || l.st; l.tz = 1; } s.logSeq = r.logSeq || s.logbook.length; s.onMap = false; s.inList = false; s.stale = true; s.snap = r.snap || null; T.ships.set(r.id, s); n++; });
-      const recent = []; await db.eachRecord('events', e => { recent.push(e); }, { index: 't', dir: 'prev', limit: LIMITS.EVENT_RING_UI });
-      T.events = recent.reverse();
+      { try { await db.eachRecord('dict', r => { dict.c2s[r.c] = r.s; dict.s2c.set(r.s, r.c); }); } catch (e) { dbg.script('warn', 'dictionary load: ' + e.message); } }
+      const recent = []; await db.eachRecord('events', e => { recent.push(unpackEvent(e)); }, { index: 't', dir: 'prev', limit: T.eventLimit });
+      T.events = recent.reverse(); for (const e of T.events) capEv(e); trimEvents(true);
       dbg.script('info', `register loaded: ${n} shuttles, ${T.events.length} recent events, session #${T.session}`);
       await T.evict();
     };
@@ -1048,20 +1219,54 @@
         }
         if (cur) trips.push(Object.assign(cur, { arrived: '', arrived_ts: null }));
       }
-      const sum = l => l.map(x => `${x.product} ${x.qty}${x.unit ? ' ' + x.unit : ''}`).join('; ');
-      return trips.map(t => ({ record_type: 'trip', ship_id: t.ship, name: t.name, owner: t.owner, old_value: t.from, new_value: t.to, server_time: t.scheduled, server_ts: iso(t.scheduled_ts), server_tz: t.scheduled ? SERVER_TZ : '', field: 'trip',
+      return trips.map(tripRow);
+    };
+    const tripSum = l => l.map(x => `${x.product} ${x.qty}${x.unit ? ' ' + x.unit : ''}`).join('; ');
+    const tripRow = t => { const sum = tripSum; return ({ record_type: 'trip', ship_id: t.ship, name: t.name, owner: t.owner, old_value: t.from, new_value: t.to, server_time: t.scheduled, server_ts: iso(t.scheduled_ts), server_tz: t.scheduled ? SERVER_TZ : '', field: 'trip',
         note: t.arrived ? 'arrived ' + t.arrived + (t.arrived_ts && t.scheduled_ts ? ` (${Math.round((t.arrived_ts - t.scheduled_ts) / 60000)} min)` : '') : 'in flight / unknown arrival',
         product: [...new Set(t.loads.map(x => x.product))].join('; '), quantity: t.loads.reduce((a, x) => a + (+x.qty || 0), 0) || '', unit: (t.loads[0] || {}).unit || '',
-        place: t.to, source: 'derived', old_value_detail: sum(t.loads), new_value_detail: sum(t.unloads) }));
+        place: t.to, source: 'derived', old_value_detail: sum(t.loads), new_value_detail: sum(t.unloads) }); };
+    /** 3.1.0 single-pass trip derivation (same rules as buildTrips) for events arriving in time order. Keeps only each
+     *  shuttle's state (place, pending loads, open trip, last closed trip still collecting unloads, and the events of the
+     *  current time stamp, which are ordered by logbook seq before use). `out(row)` gets each trip row once it is final. */
+    function tripDeriver(out) {
+      const S = new Map();
+      const st = ship => S.get(ship) || (S.set(ship, { place: '', loads: [], cur: null, last: null, pt: null, pend: [] }), S.get(ship));
+      const fin = t => { if (t) out(tripRow(t)); };
+      const step = (x, ship, e) => {
+        if (e.field === 'arrived') { if (x.cur && (!x.cur.to || x.cur.to === e.place)) { fin(x.last); x.cur.arrived = e.server; x.cur.arrived_ts = e.st; x.last = x.cur; x.last.unloads = []; x.cur = null; x.place = e.place; x.loads = []; return; } x.place = e.place; x.loads = []; }
+        else if (e.field === 'cargo_load') x.loads.push(e);
+        else if (e.field === 'cargo_unload') { if (x.last && x.last.to === e.place) x.last.unloads.push(e); }
+        else if (e.field === 'trip_start') { if (x.cur) { x.cur.arrived = ''; x.cur.arrived_ts = null; fin(x.last); x.last = null; fin(x.cur); x.cur = null; } else { fin(x.last); x.last = null; }
+          x.cur = { ship, name: e.name, owner: e.owner, from: x.place, to: e.place, scheduled: e.server, scheduled_ts: e.st, loads: x.loads.slice(), unloads: [] }; x.loads = []; }
+      };
+      const drain = (x, ship) => { x.pend.sort((a, b) => ((a.seq || 0) - (b.seq || 0)) || ((a.st || 0) - (b.st || 0))); for (const e of x.pend) step(x, ship, e); x.pend = []; };
+      return {
+        push(e) { if (!(e.source === 'logbook' || e.lk)) return; const x = st(e.ship); if (x.pt !== e.t) { drain(x, e.ship); x.pt = e.t; } x.pend.push(e); },
+        end() { for (const [ship, x] of S) { drain(x, ship); fin(x.last); if (x.cur) { x.cur.arrived = ''; x.cur.arrived_ts = null; fin(x.cur); } } S.clear(); },
+        size: () => S.size };
+    }
+    T.tripDeriver = tripDeriver;
+    /** events CSV. 3.0.10: optional `list` = export just these events (e.g. the in-memory log) instead of the stored history. */
+    /** 3.1.0 streaming events CSV: reads the store in batches (cursor), converts each batch to CSV text and hands back
+     *  a list of chunks (Blob parts in the browser), never one giant array or string. Trips are derived in the same
+     *  pass (tripDeriver) and written as they become final. Same columns and format id as before. `list` = export
+     *  just these events (in-memory log / rollover). */
+    T.exportEventsParts = async (list, o) => {
+      o = o || {}; await T.flush();
+      const parts = [], B = (typeof Blob !== 'undefined' && !o.strings) ? s => new Blob([s]) : s => s, trips = [];
+      const line = r => EVENT_CSV_COLUMNS.map(c => csvCell(r[c])).join(',') + '\r\n';
+      parts.push(B('\uFEFF' + EVENT_CSV_COLUMNS.join(',') + '\r\n' + line({ record_type: 'meta', field: 'format', new_value: 'galaxyplus-events-1', source: 'Galaxy Console ' + VERSION, event_time: iso(now()) })));
+      const td = tripDeriver(t => trips.push(line(Object.assign(t, { loaded: t.old_value_detail, offloaded: t.new_value_detail }))));
+      const take = batch => { let s = ''; for (const e of batch) { s += line(evRow(e)); td.push(e); } if (trips.length) { s += trips.join(''); trips.length = 0; } if (s) parts.push(B(s)); };
+      let n = 0;
+      if (Array.isArray(list)) { const l = list.slice().sort((a, b) => a.t - b.t); for (let i = 0; i < l.length; i += 1000) { take(l.slice(i, i + 1000)); } n = l.length; }
+      else if (db.eachBatch) await db.eachBatch('events', o.batch || 1000, b => { take(b.map(unpackEvent)); n += b.length; if (o.onProgress) o.onProgress(n); });
+      else { const all = []; await db.eachRecord('events', e => { all.push(unpackEvent(e)); }, { index: 't' }); take(all); n = all.length; }
+      td.end(); if (trips.length) parts.push(B(trips.join('')));
+      T.lastExport = { events: n, parts: parts.length }; return parts;
     };
-    T.exportEventsCSV = async () => {
-      await T.flush();
-      const all = []; await db.eachRecord('events', e => { all.push(e); }, { index: 't' });
-      const rows = [{ record_type: 'meta', field: 'format', new_value: 'galaxyplus-events-1', source: 'Galaxy Console ' + VERSION, event_time: iso(now()) }];
-      for (const e of all) rows.push(evRow(e));
-      for (const t of T.buildTrips(all)) rows.push(Object.assign(t, { loaded: t.old_value_detail, offloaded: t.new_value_detail }));
-      return toCsv(EVENT_CSV_COLUMNS, rows);
-    };
+    T.exportEventsCSV = async list => { const p = await T.exportEventsParts(list, { strings: true }); return p.join(''); }; // string form (tests, small exports)
     T.exportCSV = T.exportShipsCSV; // 0.2.3 API name
     /** Merge either CSV (or the old combined one). Never overwrite newer data; fill missing parts. Returns counts. */
     T.importCSV = async text => {
@@ -1105,8 +1310,8 @@
         T.dirty.add(id);
       }
       evs.sort((a, b) => a.t - b.t);
-      for (const e of evs) { T.events.push(e); T.pendingEvents.push(e); }
-      T.events.sort((a, b) => a.t - b.t); if (T.events.length > LIMITS.EVENT_RING_UI) T.events.splice(0, T.events.length - LIMITS.EVENT_RING_UI);
+      for (const e of evs) { addEv(e); T.pendingEvents.push(e); }
+      T.events.sort((a, b) => a.t - b.t); trimEvents(true);
       await T.flush(); dbg.script('info', 'CSV import merged', res); emit();
       return res;
     };
@@ -1460,6 +1665,8 @@
     for (const c of cols) { c.weight = parseFloat(c.w) || 10; if (c.min == null) c.min = c.num ? 48 : 70; if (c.max == null) c.max = c.num ? 130 : (c.grow ? 2000 : 320); }
     const LSK = o.id ? 'gxp.cols.' + o.id : null; let lay = { mode: 'auto', w: {}, hidden: [] };
     try { if (LSK) lay = Object.assign(lay, JSON.parse(W.localStorage.getItem(LSK) || '{}')); } catch (e) { /* */ }
+    /* 3.1.3: the sort column / direction is persisted with the layout (lay.sort) */
+    if (lay.sort && lay.sort.key && cols.some(c => c.key === lay.sort.key)) t.sort = { key: lay.sort.key, dir: lay.sort.dir < 0 ? -1 : 1 };
     const saveLay = () => { try { if (LSK) W.localStorage.setItem(LSK, JSON.stringify(lay)); } catch (e) { /* */ } };
     if (!Array.isArray(lay.hidden)) lay.hidden = [];
     const hid = k => lay.hidden.indexOf(k) >= 0;
@@ -1467,7 +1674,8 @@
     host.innerHTML = `<div class="gxp-vt-hw"><table class="gxp-vt-h"><colgroup>${colg}</colgroup><thead><tr class="gxpu_rc0">${cols.map(c => `<th class="gxpu_datarowheader" tabindex="0" data-key="${c.key}" title="${esc(c.tip || c.label)}: click to sort (again to reverse); drag the right edge to resize"><span class="gxp-thl"></span><span class="gxp-rz" data-rz="${c.key}" title="Drag to resize (switches this table to fixed widths)"></span></th>`).join('')}</tr></thead></table></div>
       ${LSK ? '<span class="gxp-vt-colbtn" role="button" tabindex="0" title="Choose columns">&#8942;</span>' : ''}<div class="gxp-vt-s"><div class="gxp-vt-sp"><table class="gxp-vt-b"><colgroup>${colg}</colgroup><tbody></tbody></table></div><div class="gxp-vt-empty"></div></div>`;
     const hw = host.querySelector('.gxp-vt-hw'), head = host.querySelector('thead tr'), sc = host.querySelector('.gxp-vt-s'), sp = host.querySelector('.gxp-vt-sp'), tb = host.querySelector('tbody'), tbl = host.querySelector('.gxp-vt-b'), empty = host.querySelector('.gxp-vt-empty');
-    const sortBy = k => { t.sort = t.sort.key === k ? { key: k, dir: -t.sort.dir } : { key: k, dir: 1 }; if (t.onSort) t.onSort(t.sort); };
+    const sortBy = k => { t.sort = t.sort.key === k ? { key: k, dir: -t.sort.dir } : { key: k, dir: 1 }; lay.sort = t.sort; saveLay(); if (t.onSort) t.onSort(t.sort); };
+    t.resetSort = () => { delete lay.sort; saveLay(); t.sort = o.sort || { key: cols[0].key, dir: 1 }; if (t.onSort) t.onSort(t.sort); };
     let widths = {}, lastAvail = -1;
     function layout(force) {
       const avail = Math.max(0, sc.clientWidth || host.clientWidth || 0); if (!force && avail === lastAvail) return; lastAvail = avail;
@@ -1553,8 +1761,14 @@
     return '';
   }
   /** Download text as a file; the object URL is revoked right after use. */
+  /** 3.1.0: download from a list of Blob parts / strings (streamed exports) without joining them into one string. */
+  function downloadParts(doc, name, parts, mime) {
+    const url = URL.createObjectURL(new Blob(parts, { type: mime || 'text/plain;charset=utf-8' }));
+    const a = doc.createElement('a'); a.href = url; a.download = name; doc.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
   function downloadText(doc, name, text, mime) {
-    const url = URL.createObjectURL(new Blob([text], { type: mime || 'text/plain;charset=utf-8' }));
+    const url = URL.createObjectURL(new Blob(Array.isArray(text) ? text : [text], { /* 3.1.5: parts (streamed chunks) accepted */ type: mime || 'text/plain;charset=utf-8' }));
     const a = doc.createElement('a'); a.href = url; a.download = name; doc.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
@@ -1683,7 +1897,7 @@
     let session;
     const client = new RequestClient({ fetchImpl: opts.fetchImpl, concurrency: 2, minGapMs: opts.minGapMs, backoffMs: opts.backoffMs, timeoutMs: opts.timeoutMs, debug: dbg,
       onSession: (state, why) => session && session.set(state, why) });
-    tracker = createTracker({ db, dbg }); await tracker.init();
+    tracker = createTracker({ db, dbg }); if (settings.eventRows) tracker.eventLimit = Math.max(1000, Math.min(200000, +settings.eventRows || LIMITS.EVENT_RING_UI)); await tracker.init();
     const capture = () => opts.capture !== undefined ? opts.capture : loadCapture();
     const transport = createTransport({ client, dbg, db, tracker, settings: () => settings, capture }); await transport.load();
     let bc = null; try { bc = new BroadcastChannel('galaxyplus'); } catch (e) { /* */ }
@@ -1703,6 +1917,7 @@
         <span class="gxbutton gxp-btn" id="gxp-refresh" role="button" tabindex="0" title="Reload lists and map now">Refresh</span>
         <span class="gxbutton gxp-btn" id="gxp-settings-btn" role="button" tabindex="0">Settings</span>
         <span id="gxp-session" class="gxp-badge" title="Sign-in state for login-only pages (transport pickers)">session: checking…</span>
+        <span id="gxp-mem" class="gxp-badge" style="display:none;background:#fff0c0;color:#7a3d00;cursor:help" title=""></span>
         <span id="gxp-status" aria-live="polite"></span>
       </div>
       <div id="gxp-main">
@@ -1736,7 +1951,7 @@
       const vt = VTable(doc, P(key).querySelector('.gxp-host'), cols, Object.assign({ id: key, onSort: () => renderAll(), onLayout: m => { msel.value = m; } }, o));
       msel.value = vt.mode(); on(msel, 'change', e => { e.stopPropagation(); vt.setMode(msel.value); dbg.script('info', `columns of ${key}: ${msel.value}`); });
       onBtn(P(key).querySelector('[data-colreset]'), () => { vt.resetWidths(); msel.value = 'auto'; });
-      app.cleanups.push(() => vt.destroy());
+      app.cleanups.push(() => vt.destroy()); (app.vts || (app.vts = {}))[key] = vt; // 3.1.3: per-tab reset of the sort
       return { vt, bar: P(key).querySelector('.gxp-bar'), count: P(key).querySelector('.gxp-count') };
     }
 
@@ -1805,7 +2020,12 @@
     }
     /** Shuttles to draw on the map: same set as the list, in reverse list order so the top rows are drawn on top. */
     function mapShips() { const vt = shipsTab.vt; return sortRows(filteredShips(), SHIP_COLS.find(c => c.key === vt.sort.key), vt.sort.dir).filter(s => s.onMap && s.mapObj).reverse(); }
-    app.filteredShips = filteredShips; app.mapShips = mapShips;
+    /* 3.1.4: shuttles that are not on the game's map layer (idle / docked at a planet, station or center: the layer only carries
+     * shuttles in flight) but have a position from the shuttle list (gxGSVzoomGalaxyPosition) are drawn at that position
+     * with their own marker, so a filtered list of idle shuttles is no longer an empty map. Setting mapShowDocked (default on). */
+    function mapDocked() { if (settings.mapShowDocked === false) return []; const vt = shipsTab.vt;
+      return sortRows(filteredShips(), SHIP_COLS.find(c => c.key === vt.sort.key), vt.sort.dir).filter(s => !(s.onMap && s.mapObj) && s.x != null && s.y != null && isFinite(s.x) && isFinite(s.y)).reverse(); }
+    app.filteredShips = filteredShips; app.mapShips = mapShips; app.mapDocked = mapDocked;
     function renderShips() {
       dupNames = new Map(); for (const s of tracker.ships.values()) dupNames.set(s.name, (dupNames.get(s.name) || 0) + 1);
       const q = sf.q.trim().toLowerCase(); $('gxp-me-lbl').textContent = 'mine = ' + meLabel();
@@ -1824,7 +2044,7 @@
     }
 
     /* ---------- Stations / Markets / Docking ---------- */
-    const cache = new LRU(LIMITS.PAGE_CACHE_LRU);
+    const cache = new LRU(LIMITS.PAGE_CACHE_LRU, MEM.PAGE_CACHE_BYTES); app.pageCache = cache;
     // 0.2.4: in-flight requests are shared per key. Before, every tab re-open / render that called a loader while the first read was
     // still running issued a NEW request on the same channel, and the client's stale guard aborted the slow one -> markets restarted.
     const inflight = new Map(), loading = {};
@@ -1994,7 +2214,7 @@
     const pickKey = r => r.product ? 'p' + r.product : r.kind + ':' + r.stationId + ':' + r.entityId + ':' + r.target + ':' + r.name;
     const pickers = {};
     for (const k of ['o', 't', 'p']) {
-      pickers[k] = VTable(doc, TP.querySelector(`[data-h=${k}]`), pickCols(k), { sort: { key: 'name', dir: 1 }, rowKey: pickKey, onSort: () => renderTransport(),
+      pickers[k] = VTable(doc, TP.querySelector(`[data-h=${k}]`), pickCols(k), { id: 'pick' + k, sort: { key: 'name', dir: 1 }, rowKey: pickKey, onSort: () => renderTransport(),
         emptyHtml: () => k === 'p' ? (trSel.o && trSel.t ? '<span class="gxp-skel"></span>' : 'Pick origin and target first.') : (session.state === 'expired' ? 'Sign in to Simcountry in another tab; Galaxy Console picks the session up automatically.' : 'Press "Load origins & targets".'),
         onRowClick: key => { const list = k === 'o' ? transport.origins : k === 't' ? transport.targets : transport.products; trSel[k] = list.find(r => pickKey(r) === key) || null;
           if (k !== 'p') { trSel.p = null; transport.products = []; if (trSel.o && trSel.t) transport.loadProducts(trSel.o, trSel.t).catch(e => trMsg('Products: ' + e.message, true)); }
@@ -2076,6 +2296,7 @@
     const trl = VTable(doc, $('gxp-trl-host'), TRL_COLS, { id: 'trlist', sort: { key: 'status', dir: 1 }, rowKey: r => r.id || routeKey(r.product, r.origin, r.target), onSort: () => renderTransport(),
       emptyHtml: () => transport.liveAt ? 'No transport matches.' : 'Not read yet.', rowClass: r => TR_STATUS[r.status].active ? '' : 'stale', onRowClick: (k, e) => { const b1 = e && e.target && e.target.closest && e.target.closest('[data-cx1]'); if (b1) { openCancelDialog([b1.dataset.cx1]); return; } if (e && e.target && e.target.matches && e.target.matches('input[data-cx]')) { const id = e.target.dataset.cx; if (e.target.checked) cancelSel.add(id); else cancelSel.delete(id); renderTransport(); return; }
         showTransport(transport.live.find(r => (r.id || routeKey(r.product, r.origin, r.target)) === k)); } });
+    (app.vts || (app.vts = {})).transport = { list: () => [trl, ...Object.values(pickers)] }; // 3.1.3: Reset filters resets these sorts
     /* 3.0.4: cancel uses the normal confirmation dialog ALWAYS (also when "Execute now" is on); one-by-one, stops at the
      * first failure, list re-read after each to verify; dry run respected (client.writeUrl). */
     async function openCancelDialog(only) {
@@ -2156,26 +2377,29 @@
       <select data-f="field" title="Show only events of this kind" aria-label="Change"><option value="all">all changes</option>${TRACKED.concat(['registered', 'flight', 'trip_start', 'arrived', 'cargo_load', 'cargo_unload', 'log']).map(f => `<option>${f}</option>`).join('')}</select>
       <select data-f="owner" title="Show only rows from this owner"><option value="all">all owners</option><option value="mine">mine</option></select>
       <span class="gxbutton gxp-btn" data-act="expShips" role="button" tabindex="0" title="Shuttle register: details, cargo, flight, full logbook per shuttle">Export shuttles CSV</span>
-      <span class="gxbutton gxp-btn" data-act="exp" role="button" tabindex="0" title="Event / trip log: every change, logbook line, cargo load/offload, derived trips">Export events CSV</span>
+      <span class="gxbutton gxp-btn" data-act="exp" role="button" tabindex="0" title="Full saved history from the browser database: every recorded change, logbook line, cargo load/offload, derived trips">Export events CSV</span> <span class="gxbutton gxp-btn" data-act="expMem" role="button" tabindex="0" title="Export only the events currently in memory (the rows this tab can show, up to the Events log rows limit; ignores the filter), same CSV format">Export in-memory events</span>
       <label class="gxbutton gxp-btn" title="Either CSV (or an old 0.2.x one); merged, duplicates skipped">Import CSV <input type="file" accept=".csv,text/csv" data-act="imp" title="Import a Galaxy Console shuttles or events CSV" style="display:none"></label>`, EV_COLS,
       { sort: { key: 't', dir: -1 }, rowKey: e => e.dk, onRowClick: k => { const e = tracker.events.find(x => x.dk === k); if (e) select(e.ship, true); }, emptyHtml: () => 'No events yet. Every poll compares each shuttle with its previous state.' });
     const evf = { q: '', field: 'all', owner: 'all' };
     const evIn = e => { const f = e.target.dataset.f; if (f) { evf[f] = e.target.value; renderAll(); } };
     on(evTab.bar, 'input', evIn); on(evTab.bar, 'change', evIn);
     const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '');
-    onBtn(evTab.bar.querySelector('[data-act=exp]'), async () => { const csv = await tracker.exportEventsCSV(); downloadText(doc, 'galaxyplus-events-' + stamp() + '.csv', csv, 'text/csv;charset=utf-8'); dbg.script('info', 'events CSV exported (' + csv.length + ' chars)'); });
+    onBtn(evTab.bar.querySelector('[data-act=expMem]'), async () => { const mem = tracker.events.length > tracker.eventLimit ? tracker.events.slice(-tracker.eventLimit) : tracker.events.slice();
+      const parts = await tracker.exportEventsParts(mem); downloadParts(doc, 'galaxyplus-events-memory-' + stamp() + '.csv', parts, 'text/csv;charset=utf-8'); dbg.script('info', `events export (in memory): ${mem.length} events`); }); // 3.0.10
+    onBtn(evTab.bar.querySelector('[data-act=exp]'), async () => { evTab.count.textContent = 'exporting…'; const parts = await tracker.exportEventsParts(null, { onProgress: n => { evTab.count.textContent = `exporting… ${fmtN(n)} events`; } }); downloadParts(doc, 'galaxyplus-events-' + stamp() + '.csv', parts, 'text/csv;charset=utf-8'); dbg.script('info', `events CSV exported (streamed: ${tracker.lastExport.events} events in ${parts.length} parts)`); }); // 3.1.0 streaming
     onBtn(evTab.bar.querySelector('[data-act=expShips]'), async () => { const csv = await tracker.exportShipsCSV(); downloadText(doc, 'galaxyplus-shuttles-' + stamp() + '.csv', csv, 'text/csv;charset=utf-8'); dbg.script('info', 'shuttles CSV exported (' + csv.length + ' chars)'); });
     on(evTab.bar.querySelector('[data-act=imp]'), 'change', async e => { const f = e.target.files[0]; if (!f) return; try { const r = await tracker.importCSV(await f.text()); evTab.count.textContent = 'Imported: ' + safeJson(r); } catch (x) { evTab.count.textContent = 'Import failed: ' + x.message; } e.target.value = ''; renderAll(); });
     function renderEvents() {
       const q = evf.q.toLowerCase();
-      let r = tracker.events.filter(e => (evf.field === 'all' || e.field === evf.field) && (evf.owner === 'all' || isMine(e.owner, e.ownerKey)) && textMatch(q, [e.name, e.owner, e.from, e.to, e.ship]));
+      const evAll = tracker.events.length > tracker.eventLimit ? tracker.events.slice(-tracker.eventLimit) : tracker.events; // 3.0.9: view = newest <limit> rows
+      let r = evAll.filter(e => (evf.field === 'all' || e.field === evf.field) && (evf.owner === 'all' || isMine(e.owner, e.ownerKey)) && textMatch(q, [e.name, e.owner, e.from, e.to, e.ship]));
       r = sortRows(r, EV_COLS.find(c => c.key === evTab.vt.sort.key), evTab.vt.sort.dir); evTab.vt.setRows(r);
-      if (!/^Imported|^Import failed/.test(evTab.count.textContent)) evTab.count.textContent = `${r.length} of ${tracker.events.length} events in memory (all are in IndexedDB)`;
+      if (!/^Imported|^Import failed/.test(evTab.count.textContent)) evTab.count.textContent = `${r.length} of ${evAll.length} events in memory (all are in IndexedDB)`;
     }
 
     /* ---------- Debug ---------- */
     const DB_COLS = [{ key: 'n', label: '#', w: '6%', num: true, max: 60 }, { key: 't', label: 'Time', w: '14%', num: true, min: 110, max: 130, html: e => fmtTime(e.t) }, { key: 'channel', label: 'Channel', w: '8%' }, { key: 'level', label: 'Level', w: '7%' },
-      { key: 'msg', label: 'Message', w: '65%', grow: true, min: 300, html: e => esc(e.msg) + (e.data !== undefined ? ' <span class="gxp-id">' + esc(safeJson(e.data)) + '</span>' : ''), title: e => e.msg }];
+      { key: 'msg', label: 'Message', w: '65%', grow: true, min: 300, html: e => esc(e.msg) + (e.dataText !== undefined ? ' <span class="gxp-id">' + esc(e.dataText.length > 2000 ? e.dataText.slice(0, 2000) + '…' : e.dataText) + '</span>' : ''), title: e => e.msg }];
     const dbTab = listTab('debug', `<select data-f="channel" title="Debug log source"><option value="all">both channels</option><option value="net">network</option><option value="script">script</option></select>
       <select data-f="level" title="Minimum debug level to show"><option value="debug">debug+</option><option value="info">info+</option><option value="warn">warn+</option><option value="error">error</option></select>
       <span class="gxbutton gxp-btn" data-act="exp" role="button" tabindex="0">Export text</span>
@@ -2183,11 +2407,18 @@
       <span class="gxbutton gxp-btn" data-act="copy500" role="button" tabindex="0" title="Copy the newest 500 lines (all channels and levels) to the clipboard">Copy last 500</span> <span class="gxbutton gxp-btn" data-act="exp500" role="button" tabindex="0" title="Download the newest 500 lines (all channels and levels) as a .txt file">Export last 500</span>`, DB_COLS, { sort: { key: 'n', dir: -1 }, rowKey: e => String(e.n) });
     const dbf = { channel: 'all', level: settings.debugLevel || 'info' }; dbTab.bar.querySelector('[data-f=level]').value = dbf.level;
     on(dbTab.bar, 'change', e => { const f = e.target.dataset.f; if (f) { dbf[f] = e.target.value; if (f === 'level') { settings.debugLevel = dbf.level; saveSettings(); } renderAll(); } });
-    onBtn(dbTab.bar.querySelector('[data-act=exp]'), () => downloadText(doc, 'galaxyplus-debug.txt', dbg.toText(dbf.channel, dbf.level)));
-    const copyLog = async n => { const all = dbg.toText('all', 'debug').split('\n'); const lines = n ? all.slice(-n) : all; const text = lines.join('\n');
+    const chunkParts = (ch, lv, last) => { const p = []; for (const c of dbg.textChunks(ch, lv, last)) { if (p.length) p.push('\n'); p.push(c); } return p; }; // 3.1.5: no single giant string
+    onBtn(dbTab.bar.querySelector('[data-act=exp]'), () => downloadText(doc, 'galaxyplus-debug.txt', chunkParts(dbf.channel, dbf.level)));
+    const copyLog = async n => { const lines = n ? dbg.entries('all', 'debug').slice(-n) : dbg.entries('all', 'debug'); const text = chunkParts('all', 'debug', n || 0).join('');
       const how = await copyText(doc, text); dbTab.count.textContent = how ? `copied ${lines.length} lines (${how})` : 'copy failed: use Export text'; dbg.script(how ? 'info' : 'warn', `debug log copy: ${lines.length} lines via ${how || 'nothing'}`); };
     onBtn(dbTab.bar.querySelector('[data-act=copyAll]'), () => copyLog(0)); onBtn(dbTab.bar.querySelector('[data-act=copy500]'), () => copyLog(500));
-    onBtn(dbTab.bar.querySelector('[data-act=exp500]'), () => { const lines = dbg.toText('all', 'debug').split('\n').slice(-500); downloadText(doc, `galaxy-console-debug-last500-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`, lines.join('\n'), 'text/plain'); dbg.script('info', `debug log export: last ${lines.length} lines`); }); // 3.0.6
+    onBtn(dbTab.bar.querySelector('[data-act=exp500]'), () => { const lines = dbg.entries('all', 'debug').slice(-500); downloadText(doc, `galaxy-console-debug-last500-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`, chunkParts('all', 'debug', 500), 'text/plain'); dbg.script('info', `debug log export: last ${lines.length} lines`); }); // 3.0.6
+    /* 3.0.9: reset buttons (in-memory views only), each with a simple confirm */
+    const askOk = m => (typeof opts.confirm === 'function' ? !!opts.confirm(m) : W.confirm(m));
+    dbTab.bar.insertAdjacentHTML('beforeend', ' <span class="gxbutton gxp-btn" data-act="dbgReset" role="button" tabindex="0" title="Clear the debug log kept in memory (export it first if you need it)">Reset log</span>');
+    onBtn(dbTab.bar.querySelector('[data-act=dbgReset]'), () => { if (askOk('Clear the debug log in memory?')) { dbg.reset(); renderAll(); } });
+    evTab.bar.insertAdjacentHTML('beforeend', ' <span class="gxbutton gxp-btn" data-act="evReset" role="button" tabindex="0" title="Clear the events list kept in memory (this view). Saved history in the browser database and the events CSV export is NOT deleted.">Reset view</span>');
+    onBtn(evTab.bar.querySelector('[data-act=evReset]'), () => { if (askOk('Clear the events list in memory? Saved history is kept.')) { tracker.resetEvents(); renderAll(); } });
     let dbgDirty = false; app.cleanups.push(dbg.subscribe(() => { dbgDirty = true; }));
     function renderDebug() { const r = sortRows(dbg.entries(dbf.channel, dbf.level), DB_COLS.find(c => c.key === dbTab.vt.sort.key), dbTab.vt.sort.dir); dbTab.vt.setRows(r); if (!/^cop/.test(dbTab.count.textContent) || Date.now() - (dbTab._ct || 0) > 4000) { dbTab.count.textContent = `${r.length} of ${dbg.size()} entries (ring of ${LIMITS.DEBUG_RING})`; } }
     every(() => { if (dbgDirty && activeTab === 'debug') { dbgDirty = false; renderDebug(); } }, 1000);
@@ -2216,8 +2447,9 @@
     /* ---------- map ---------- */
     const mapEl = $('gxp-map'), wrap = $('gxp-mapwrap'), marker = $('gxp-marker');
     let scale = 1, drawnVer = -1, mapVer = 0, globes = [], stationsL = [];
+    const DOCKED_ICON = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="3.6" fill="#ffd54a" stroke="#3a2c00" stroke-width="1.2"/></svg>');
     function renderMap() {
-      const ms = mapShips(), msKey = ms.map(s => s.id + ':' + s.mapObj.left + ',' + s.mapObj.top + (s.mapMiss ? 'm' : '')).join('|'); // 0.2.7: list filters drive the map
+      const ms = mapShips(), md = mapDocked(), msKey = ms.map(s => s.id + ':' + s.mapObj.left + ',' + s.mapObj.top + (s.mapMiss ? 'm' : '')).join('|') + '#' + md.map(s => s.id + ':' + Math.round(s.x) + ',' + Math.round(s.y)).join('|'); // 0.2.7: list filters drive the map; 3.1.4: + idle/docked
       if (msKey !== renderMap.key) { renderMap.key = msKey; mapVer++; }
       if (drawnVer !== mapVer) { drawnVer = mapVer;
         for (const n of [...mapEl.querySelectorAll('img.obj')]) n.remove();
@@ -2225,6 +2457,7 @@
         const add = (o, cls, z, title, id) => { const i = doc.createElement('img'); i.className = 'obj ' + cls; i.src = o.icon; i.alt = title; i.title = title;
           i.style.cssText = `left:${o.left}px;top:${o.top}px;width:${o.w}px;height:${o.h}px;z-index:${z}`; if (id) i.dataset.id = id; frag.appendChild(i); };
         for (const g of globes) add(g, 'globe', 3, g.name + ' (click: world info)', g.id); for (const s of stationsL) add(s, 'station', 4, s.name + ' (click: station details)', s.id);
+        for (const s of md) add({ icon: DOCKED_ICON, left: s.x - 5, top: s.y - 5, w: 10, h: 10 }, 'shipd', 5, s.name + ' (' + s.owner + ') — ' + (s.status || 'idle') + (s.location ? ' at ' + s.location : '') + ' (not on the map layer: position from the shuttle list)', s.id);
         for (const s of ms) { add(s.mapObj, 'ship', 6, s.name + ' (' + s.owner + ')' + (s.mapMiss ? ` — last known position (missing from ${s.mapMiss} map refresh${s.mapMiss > 1 ? 'es' : ''})` : ''), s.id); if (s.mapMiss) frag.lastChild.style.opacity = '0.45'; }
         mapEl.appendChild(frag); }
       const s = tracker.ships.get(selected);
@@ -2236,7 +2469,7 @@
     let drag = null;
     on(wrap, 'pointerdown', e => { if (e.target.closest('#gxp-maptools')) return; drag = { x: e.clientX, y: e.clientY, sl: wrap.scrollLeft, st: wrap.scrollTop, moved: false }; });
     on(W, 'pointermove', e => { if (!drag) return; const dx = e.clientX - drag.x, dy = e.clientY - drag.y; if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true; wrap.scrollLeft = drag.sl - dx; wrap.scrollTop = drag.st - dy; });
-    on(W, 'pointerup', e => { if (drag && !drag.moved) { const t = e.target.closest && e.target.closest('img.ship'); if (t) select(t.dataset.id, false, true); const gl = e.target.closest && e.target.closest('img.globe'); if (gl && gl.dataset.id) showWorld(gl.dataset.id); const st = e.target.closest && e.target.closest('img.station'); if (st && st.dataset.id) openStationFromMap(st.dataset.id, st.title.replace(/ \(click.*$/, '')); } drag = null; });
+    on(W, 'pointerup', e => { if (drag && !drag.moved) { const t = e.target.closest && e.target.closest('img.ship,img.shipd'); if (t) select(t.dataset.id, false, true); const gl = e.target.closest && e.target.closest('img.globe'); if (gl && gl.dataset.id) showWorld(gl.dataset.id); const st = e.target.closest && e.target.closest('img.station'); if (st && st.dataset.id) openStationFromMap(st.dataset.id, st.title.replace(/ \(click.*$/, '')); } drag = null; });
     on(wrap, 'wheel', e => { e.preventDefault(); setScale(scale * (e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR)); }, { passive: false });
     onBtn($('gxp-zin'), () => setScale(scale * ZOOM_FACTOR)); onBtn($('gxp-zout'), () => setScale(scale / ZOOM_FACTOR));
 
@@ -2296,7 +2529,7 @@
       d = doc.createElement('div'); d.id = 'gxp-dialog'; d.className = 'gxp-dialog'; d.setAttribute('role', 'dialog'); d.setAttribute('aria-label', 'Galaxy Console settings');
       const gate = writeGate(Object.assign({}, settings, { writesEnabled: true }), transport.template);
       d.innerHTML = `<b>Galaxy Console settings</b>
-        <div class="gxp-subtabs" role="tablist">${[['general', 'General'], ['sending', 'Sending'], ['notify', 'Notifications'], ['keys', 'Shortcuts'], ['dev', 'Developer']].map(([k, l], i) => `<span role="tab" tabindex="0" data-subtab="${k}" class="${i ? '' : 'on'}">${l}</span>`).join('')}</div>
+        <div class="gxp-subtabs" role="tablist">${[['general', 'General'], ['sending', 'Sending'], ['notify', 'Notifications'], ['keys', 'Shortcuts'], ['events', 'Events'], ['debug', 'Debug'], ['dev', 'Developer']].map(([k, l], i) => `<span role="tab" tabindex="0" data-subtab="${k}" class="${i ? '' : 'on'}">${l}</span>`).join('')}</div>
         <div data-sub="general">
         <label>Owner names for "mine", comma-separated; replaces auto-detection (empty = detect automatically). Now: ${esc(meLabel())}<br><input data-s="meOverride" title="Leave empty to detect your owner names automatically" size="40" value="${esc(settings.meOverride)}"></label>
         <label>Extra owner names (your other countries / corporations), added to the detected ones: <input data-s="meExtra" title="Names of your other countries or corporations, comma-separated" size="40" value="${esc(settings.meExtra)}"></label>
@@ -2305,6 +2538,7 @@
         <label><input type="checkbox" data-s="linkNames" ${settings.linkNames !== false ? 'checked' : ''}> Clickable country/owner names (open the game page in a new tab)</label>
         <label style="margin-left:18px"><input type="checkbox" data-s="linkNamesTables" ${settings.linkNamesTables !== false ? 'checked' : ''} ${settings.linkNames === false ? 'disabled' : ''}> also in tables</label>
         <label>Keep a shuttle missing from the map layer at its last position (dimmed) for <input data-s="mapMissTolerance" title="0 = drop at once; higher = more tolerant of incomplete map answers" type="number" min="0" step="1" value="${settings.mapMissTolerance == null ? 3 : settings.mapMissTolerance}" style="width:50px"> refreshes</label>
+        <label><input type="checkbox" data-s="mapShowDocked" ${settings.mapShowDocked !== false ? 'checked' : ''} title="The game's map layer only carries shuttles in flight. When on, idle / docked shuttles of the current list are drawn as small yellow dots at their position from the shuttle list."> Show idle / docked shuttles on the map (yellow dots)</label>
         <label><input type="checkbox" data-s="autoDetails" ${settings.autoDetails ? 'checked' : ''}> refresh shuttle details automatically</label>
         <label><input type="checkbox" data-s="writesEnabled" ${settings.writesEnabled ? 'checked' : ''}> <b>enable writes</b> (master switch)</label>
         <fieldset style="margin:4px 0"><legend>Write actions (each also needs the master switch)</legend>
@@ -2313,11 +2547,10 @@
           <label title="Not available yet"><input type="checkbox" disabled> cargo · docking · trading <span class="gxp-approx">(not yet)</span></label>
           <span class="gxp-approx">Transport requests use the master switch only. Every write shows one confirmation with the details first.</span></fieldset>
         </div><div data-sub="sending" style="display:none">${settingsSendingHtml()}</div><div data-sub="notify" style="display:none">${settingsNotifyHtml()}</div><div data-sub="keys" style="display:none">${settingsKeysHtml()}</div>
+        <div data-sub="events" style="display:none"></div><div data-sub="debug" style="display:none"></div>
         <div data-sub="dev" style="display:none">
         <label><input type="checkbox" data-s="devTools" ${settings.devTools ? 'checked' : ''}> Developer / debug tools</label>
-        <label data-dev="1" style="margin-left:18px;${settings.devTools ? '' : 'display:none'}"><input type="checkbox" data-s="dryRun" ${settings.dryRun ? 'checked' : ''}> <b>Dry run</b>: writes go through the confirmation but are not sent (shows the exact request)</label>
-        <p class="gxp-approx" style="margin-left:18px">Shows the Debug tab, form capture, raw-response buttons and Dry run. Leave this OFF unless support or the developer asks you to turn it on. Galaxy Console keeps logging internally either way.</p>
-        <label data-dev="1" style="margin-left:18px;${settings.devTools ? '' : 'display:none'}"><input type="checkbox" data-s="formCapture" ${settings.formCapture ? 'checked' : ''}> <b>Form capture</b>: show the "Capture … forms" buttons (read-only scans for the developer)</label>
+        <p class="gxp-approx" style="margin-left:18px">Shows the Debug tab (debug log, its settings, Dry run, form capture) and raw-response buttons. Events settings are in the Events tab. Leave this OFF unless support or the developer asks you to turn it on. Galaxy Console keeps logging internally either way.</p>
         </div>
         <p class="gxp-approx">Write method: gxAddTransportRequest. Form capture: ${esc(gate.ok ? gate.why : gate.why)}</p>
         <p class="gxp-approx">Register: ${tracker.ships.size} shuttles, session #${tracker.session}. Eviction: unseen &gt; ${C.EVICT_DAYS} days AND &gt;= ${C.EVICT_SESSIONS} sessions.</p>
@@ -2327,7 +2560,7 @@
         saveSettings(); foot(); if (k === 'linkNames') { const sub2 = d.querySelector('[data-s=linkNamesTables]'); if (sub2) sub2.disabled = !settings.linkNames; }
         if (k === 'linkNames' || k === 'linkNamesTables') { LK.at = 0; renderAll(); if (typeof forceDetails === 'function') forceDetails(); }
         if (k === 'devTools' || k === 'formCapture') applyDevTools(); if (k === 'linkNames' || k === 'linkNamesTables') applyExtUl(); if (k.indexOf('notify') === 0) notifySettingChanged(k); dbg.script('info', 'setting ' + k + ' = ' + settings[k]); if (k === 'meOverride' || k === 'meExtra') logMine('settings changed'); renderAll(); });
-      onBtn(d.querySelector('[data-close]'), () => d.remove()); settingsDialogExtras(d);
+      onBtn(d.querySelector('[data-close]'), () => d.remove()); settingsDialogExtras(d); settingsLogExtras(d);
       onBtn(d.querySelector('[data-act=forgetOwner]'), () => { owner.names.clear(); owner.keys.clear(); try { W.localStorage.removeItem('gxp.owner'); } catch (e) { /* */ } app._ownerProbe = app._ownerListRead = false; dbg.script('info', 'detected owner forgotten'); d.remove(); renderAll(); });
     });
 
@@ -2382,6 +2615,7 @@
       const html = await cachedRead('logs:' + s.id, 'gxShipLogs', { miObjectID: s.id, miObjectView: 0, miObjectSort: 2, miObjectOrder: -1 }, TTL.logs);
       const r = parseLogTable(html); if (!r.ok) throw new Error('unrecognised logbook page');
       X25.shipLogs.set(s.id, { at: Date.now(), rows: r.rows, empty: r.empty });
+      if (X25.shipLogs.size > MEM.SHIPLOG_CACHE) { const old = [...X25.shipLogs.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, X25.shipLogs.size - MEM.SHIPLOG_CACHE); for (const [k] of old) X25.shipLogs.delete(k); } // 3.1.5
       const fresh = tracker.recordLogbook(s, r.rows.map(x => ({ when: x.when, text: x.text }))); T25dirty(s);
       dbg.script('debug', `logbook tab ${s.name}#${s.id.slice(-6)}: ${r.rows.length} lines, ${fresh} new in register`);
     }
@@ -2581,7 +2815,7 @@
     const CAP_KEY = 'gxp.formCapture026', CAP_MAX = 300;
     var fcap = []; try { fcap = JSON.parse(W.localStorage.getItem(CAP_KEY) || '[]'); } catch (e) { fcap = []; }
     const capSave = () => { try { W.localStorage.setItem(CAP_KEY, JSON.stringify(fcap.slice(-CAP_MAX))); } catch (e) { dbg.script('warn', 'fcap not saved: ' + e.message); } };
-    function capAdd(item) { item.at = Date.now(); item.version = VERSION; fcap.push(item); if (fcap.length > CAP_MAX) fcap.splice(0, fcap.length - CAP_MAX); capSave();
+    function capAdd(item) { item.at = Date.now(); item.version = VERSION; { const j = safeJson(item); if (j.length > MEM.CAPTURE_ITEM) item = { kind: item.kind, fn: item.fn, method: item.method, at: item.at, version: VERSION, truncated: true, json: capStr(j, MEM.CAPTURE_ITEM) }; } fcap.push(item); // 3.1.5: per-item cap if (fcap.length > CAP_MAX) fcap.splice(0, fcap.length - CAP_MAX); capSave();
       dbg.script('info', `form capture: ${item.kind} ${item.fn || item.method || ''} ${item.forms ? item.forms.length + ' form(s)' : ''} ${item.actions ? item.actions.length + ' action call(s)' : ''}`.trim(), item); renderCapBtn(); }
     /** Strip anything session-like before export (the pages carry none, but be safe). */
     function capScrub(s) { return String(s).replace(/(Passport|SN_SESSION|session|sessid|cookie)=([^&"'\s;]+)/gi, '$1=<removed>'); }
@@ -3097,18 +3331,46 @@
     }
 
     /* ---------- Trends tab (from the register; keeps 4 real days, oldest purged) ---------- */
+    /* 3.1.0 Trends: incremental aggregates. Before, opening the tab (and a 5-minute timer) re-read every stored event
+     * from IndexedDB, derived all trips and rewrote the whole table: the cost grew with the register (see TEST/ARCH notes).
+     * Now each recorded event updates the hour buckets as it is added (event hook), the buckets are cached in meta
+     * 'trendHist' { v: 2 }, the tab renders straight from memory, and a full recompute only runs in the background
+     * (batched cursor reads, yielding between batches): at first start after the upgrade and on "Refresh". */
     const HOUR = 3600000, KEEP = 4 * 86400000; let trend = {}; let trendWin = 86400000;
-    async function trendsRebuild() {
-      await tracker.flush(); const since = nowMs() - KEEP, evs = []; await db.eachRecord('events', e => { if ((e.st || e.t) >= since - 86400000) evs.push(e); }, { index: 't' });
-      const b = {}, B = t => { const h = Math.floor(t / HOUR) * HOUR; return b[h] || (b[h] = { routes: {}, products: {}, stations: {} }); }, add = (o, k, n) => { if (k) o[k] = (o[k] || 0) + n; };
-      for (const e of evs) { const t = e.st || e.t; if (t < since) continue;
-        if (e.field === 'cargo_load') { add(B(t).products, e.product, +e.qty || 0); add(B(t).stations, e.place, 1); }
-        else if (e.field === 'cargo_unload' || e.field === 'arrived' || e.field === 'trip_start') add(B(t).stations, e.place, 1); }
-      for (const tr of tracker.buildTrips(evs)) { const t = Date.parse(tr.server_ts || '') || 0; if (t >= since && tr.old_value && tr.new_value) add(B(t).routes, tr.old_value + ' → ' + tr.new_value, 1); }
-      const stored = await db.getMeta('trendHist', {}) || {}; for (const h of Object.keys(b)) stored[h] = b[h];
-      for (const h of Object.keys(stored)) if (+h < since) delete stored[h];
-      await db.setMeta('trendHist', stored); trend = stored; return trend;
+    let trPlace = new Map(), trendDirty = false, trendDelta = null, trendJob = null;
+    const tBucket = (o, t) => { const h = Math.floor(t / HOUR) * HOUR; const b = o[h] || (o[h] = { routes: {}, products: {}, stations: {}, types: {}, owners: {} }); if (!b.types) { b.types = {}; b.owners = {}; } return b; };
+    const addN = (o, k, n) => { if (k) o[k] = (o[k] || 0) + n; };
+    function trendApply(o, places, e) {
+      const t = e.st || e.t, old = t < nowMs() - KEEP;
+      if (!old) { const b = tBucket(o, t); addN(b.types, e.field, 1); } // 3.1.3: every recorded event, by type (graph)
+      if (!(e.source === 'logbook' || e.lk)) return;
+      if (!old && e.owner) addN(tBucket(o, t).owners, e.owner, 1); // 3.1.3: logbook events per owner (graph)
+      if (e.field === 'arrived') { if (!old) addN(tBucket(o, t).stations, e.place, 1); if (e.place) places.set(e.ship, e.place); return; }
+      if (old) return;
+      if (e.field === 'cargo_load') { addN(tBucket(o, t).products, e.product, +e.qty || 0); addN(tBucket(o, t).stations, e.place, 1); }
+      else if (e.field === 'cargo_unload') addN(tBucket(o, t).stations, e.place, 1);
+      else if (e.field === 'trip_start') { addN(tBucket(o, t).stations, e.place, 1); const from = e.from || places.get(e.ship); if (from && e.place) addN(tBucket(o, t).routes, from + ' → ' + e.place, 1); }
     }
+    const trendPurge = o => { const since = nowMs() - KEEP; for (const h of Object.keys(o)) if (+h + HOUR < since) delete o[h]; return o; };
+    tracker.eventHooks.add(e => { trendApply(trend, trPlace, e); trendDirty = true; if (trendDelta) trendDelta.push(e); });
+    const trendSave = async () => { if (!trendDirty) return; trendDirty = false; trendPurge(trend); await db.setMeta('trendHist', { v: 3, at: nowMs(), data: trend }); }; // 3.1.3: v3 adds types / owners
+    /** full recompute in the background; events added meanwhile are applied once (by their time) afterwards */
+    function trendsRebuild() {
+      if (trendJob) return trendJob;
+      trendJob = (async () => {
+        const t0 = nowMs(); trendDelta = []; await tracker.flush(); const fresh = {}, pl = new Map(); let n = 0; const tStart = Date.now();
+        if (db.eachBatch) await db.eachBatch('events', 1000, async b => { for (const r of b) { const e = tracker.unpackEvent(r); if (e.t <= t0) trendApply(fresh, pl, e); } n += b.length; await new Promise(r => setTimeout(r, 0)); }, { t: t0 - KEEP - 86400000, dks: [] });
+        for (const e of trendDelta) if (e.t > t0) trendApply(fresh, pl, e);
+        trendDelta = null; trend = trendPurge(fresh); trPlace = pl; trendDirty = true; await trendSave();
+        app.trendStats = { events: n, ms: Date.now() - tStart, at: nowMs() }; dbg.script('info', `trends recomputed in the background: ${n} events, ${app.trendStats.ms} ms`);
+        if (activeTab === 'trends') renderTrends(); return trend;
+      })().finally(() => { trendJob = null; });
+      return trendJob;
+    }
+    app.trendsRebuild = trendsRebuild; app.trendNow = () => trend;
+    (async () => { const st = await db.getMeta('trendHist', null);
+      if (st && st.v === 3) { trend = trendPurge(st.data || {}); if (activeTab === 'trends') renderTrends(); }
+      else { if (st && typeof st === 'object') trend = trendPurge(st.data || st); setTimeout(() => trendsRebuild().catch(e => dbg.script('warn', 'trends: ' + e.message)), opts.trendStartDelayMs != null ? opts.trendStartDelayMs : 5000); } })().catch(() => {});
     function trendAgg(win) { const since = nowMs() - win, out = { routes: {}, products: {}, stations: {} }, perHour = {};
       for (const [h, v] of Object.entries(trend)) { if (+h + HOUR < since) continue; for (const k of ['routes', 'products', 'stations']) for (const [n, c] of Object.entries(v[k])) out[k][n] = (out[k][n] || 0) + c;
         for (const [n, c] of Object.entries(v.stations)) (perHour[n] || (perHour[n] = {}))[h] = c; }
@@ -3132,12 +3394,12 @@
         for (const [k, n] of Object.entries(v.products)) rows.push(['product', iso, k, '', n].map(csvQ).join(','));
         for (const [k, n] of Object.entries(v.stations)) rows.push(['station', iso, k, n, ''].map(csvQ).join(',')); }
       return '\uFEFF' + rows.join('\r\n'); }
-    const exportTrends = async () => { await trendsRebuild(); downloadText(doc, 'galaxyconsole-trends-' + new Date().toISOString().slice(0, 10) + '.csv', trendsCSV(), 'text/csv;charset=utf-8'); };
-    on(P('trends'), 'click', async e => { const a = e.target.closest('[data-act]'); if (!a) return; if (a.dataset.act === 'trRefresh') { await trendsRebuild(); renderTrends(); } if (a.dataset.act === 'trExport') exportTrends(); });
+    const exportTrends = async () => { await trendSave(); downloadText(doc, 'galaxyconsole-trends-' + new Date().toISOString().slice(0, 10) + '.csv', trendsCSV(), 'text/csv;charset=utf-8'); };
+    on(P('trends'), 'click', async e => { const a = e.target.closest('[data-act]'); if (!a) return; if (a.dataset.act === 'trRefresh') { $('gxp-trend-info').textContent = 'recomputing in the background…'; await trendsRebuild(); renderTrends(); } if (a.dataset.act === 'trExport') exportTrends(); });
     on(P('trends'), 'change', e => { if (e.target.dataset.tw != null) { trendWin = +e.target.value; renderTrends(); } });
     { const evBar = P('events').querySelector('.gxp-bar'); if (evBar) { evBar.insertAdjacentHTML('beforeend', ' <span class="gxbutton gxp-btn" data-act="trExport2" role="button" tabindex="0" title="Busiest routes, products and station activity per hour (last 4 days)">Export trends CSV</span>'); onBtn(evBar.querySelector('[data-act=trExport2]'), exportTrends); } }
-    tabOpeners.trends = () => { trendsRebuild().then(renderTrends).catch(e => dbg.script('warn', 'trends: ' + e.message)); };
-    every(() => { trendsRebuild().then(() => { if (activeTab === 'trends') renderTrends(); }).catch(() => {}); }, opts.trendTickMs || 300000);
+    tabOpeners.trends = () => { renderTrends(); }; // 3.1.0: from the cached aggregates, no database scan
+    every(() => { trendSave().catch(() => {}); if (activeTab === 'trends') renderTrends(); }, opts.trendTickMs || 60000);
 
     /* ---------- keyboard shortcuts (configurable) ---------- */
     const SC_DEFAULT = { tabNext: 'Alt+ArrowRight', tabPrev: 'Alt+ArrowLeft', refresh: 'Alt+R', focusFilter: '/', listDown: 'J', listUp: 'K', mapFull: 'Alt+F', settings: 'Alt+S' };
@@ -3162,8 +3424,56 @@
       else if (act === 'refresh') $('gxp-refresh').click(); else if (act === 'focusFilter') { const f = P(activeTab).querySelector('input[type=search]'); if (f) f.focus(); }
       else if (act === 'listDown') listStep(1); else if (act === 'listUp') listStep(-1); else if (act === 'mapFull') mapFullscreen(!mapFs.on); else if (act === 'settings') $('gxp-settings-btn').click(); }
     function settingsKeysHtml() { const m = sc(); return '<table class="gxp-mini">' + Object.keys(SC_DEFAULT).map((k, i) => `<tr class="gxpu_rc${i % 2}"><td>${esc(SC_LABEL[k])}</td><td><input data-sckey="${k}" value="${esc(m[k])}" readonly style="width:130px" title="Click, then press the new key combination (Backspace = none)"></td><td><span class="gxp-chip" data-screset="${k}" role="button" tabindex="0">default</span></td></tr>`).join('') + '</table><p class="gxp-approx">Shortcuts are ignored while you type in a field (except ones with Alt/Ctrl). In full-screen map: arrows pan, + and − zoom, Esc exits.</p><span class="gxbutton gxp-btn" data-screset="*" role="button" tabindex="0">Reset all</span>'; }
+    /* 3.0.8: event types recorded in the events register (all on by default; settings.eventsOff = { type: true }). */
+    const EVENT_TYPES = [
+      ['Shuttle logbook (read from the shuttle info page)', [
+        ['trip_start', 'Logbook line: the shuttle started a trip (departure).'],
+        ['arrived', 'Logbook line: the shuttle arrived at a space center or station.'],
+        ['cargo_load', 'Logbook line: cargo loaded (product, quantity).'],
+        ['cargo_unload', 'Logbook line: cargo unloaded / delivered (product, quantity).'],
+        ['log', 'Any other logbook line not recognised as the types above (best guess: maintenance, misc. game messages).']]],
+      ['Shuttle changes (seen in the lists, map and info pages)', [
+        ['registered', 'A shuttle was seen for the first time and added to the register.'],
+        ['location', 'The shuttle\'s location changed.'],
+        ['destination', 'The shuttle\'s destination changed (set, changed or cleared).'],
+        ['cargo', 'The cargo amount shown in the shuttle list changed.'],
+        ['cargo_items', 'The cargo item list on the shuttle\'s cargo page changed.'],
+        ['missions', 'Missions left changed (each flight uses one; 0 = retired).'],
+        ['sinceTu', 'Time units since the last event changed (best guess: ticks up while idle or flying; very frequent).'],
+        ['arrivalTu', 'Time units until arrival changed (frequent while in flight).'],
+        ['status', 'Status changed (idle / in flight / retired …).'],
+        ['onMap', 'The shuttle appeared on or disappeared from the galaxy map layer.'],
+        ['flight', 'A new flight plan target was seen on the shuttle info page.']]],
+      ['Your actions in Galaxy Console', [
+        ['write_rename', 'You renamed a shuttle (outcome and request).'],
+        ['write_flight', 'You sent a shuttle on a flight (outcome and request).'],
+        ['write_cancel_transport', 'You cancelled a transport request (outcome and the game\'s reply).']]]];
+    app.EVENT_TYPES = EVENT_TYPES;
+    /* 3.0.8: retained-row limits (persisted as settings.debugRows / settings.eventRows) */
+    function applyLimits(kind, v) {
+      if (kind === 'debug') settings.debugRows = dbg.setLimit(v); else if (kind === 'events') settings.eventRows = tracker.setEventLimit(v);
+      saveSettings(); dbg.script('info', `${kind} log limit = ${kind === 'debug' ? dbg.limit() : tracker.eventLimit} rows`); renderAll(); }
+    app.applyLimits = applyLimits;
+    if (settings.debugRows) dbg.setLimit(settings.debugRows); if (settings.eventRows) tracker.setEventLimit(settings.eventRows);
+    /* Basic level (default): only trips, cargo, new shuttles and your own actions are recorded. */
+    const EV_BASIC_OFF = ['log', 'location', 'destination', 'cargo', 'cargo_items', 'missions', 'sinceTu', 'arrivalTu', 'status', 'onMap', 'flight'];
+    const basicOff = () => EV_BASIC_OFF.reduce((o, k) => (o[k] = true, o), {});
+    const evOn = k => !((settings.eventsOff || basicOff())[k]);
+    tracker.eventFilter = k => evOn(k);
+    function settingsEventsHtml() {
+      return `<p class="gxpu_text">Event types recorded in the events register (Events tab, events CSV, trends, notifications). Default is the basic level. Unchecked types are not recorded from now on; data already stored is kept.</p>
+        <p><span class="gxbutton gxp-btn" data-evall="1" role="button" tabindex="0" title="Record every event type">Select all</span> <span class="gxbutton gxp-btn" data-evall="0" role="button" tabindex="0" title="Record no events (shuttle data is still kept)">Select none</span> <span class="gxbutton gxp-btn" data-evall="basic" role="button" tabindex="0" title="Restore the default basic level: trip_start, arrived, cargo_load, cargo_unload, registered and your own actions (rename, flight, cancel)">Basic (default)</span></p>` +
+        EVENT_TYPES.map(([g, list]) => `<fieldset><legend>${esc(g)}</legend>${list.map(([k, tip]) => `<label title="${esc(tip)}" style="display:inline-block;min-width:190px"><input type="checkbox" data-evt="${k}" ${evOn(k) ? 'checked' : ''}> ${esc(k)}</label>`).join(' ')}</fieldset>`).join('') +
+        `<p class="gxp-approx">Note: trips, trends and arrival notifications are built from trip_start / arrived / cargo events; turning those off stops them updating.</p>`;
+    }
+    function setEventType(k, onv) { const o = Object.assign({}, settings.eventsOff || basicOff()); if (onv) delete o[k]; else o[k] = true; settings.eventsOff = o; }
+    app.setEventType = (k, v) => { setEventType(k, v); saveSettings(); };
     function settingsDialogExtras(d) {
       const tabsEl = d.querySelector('.gxp-subtabs'); if (!tabsEl) return;
+      on(d, 'change', e => { const c = e.target.closest && e.target.closest('[data-evt]'); if (!c) return; setEventType(c.dataset.evt, c.checked); saveSettings(); dbg.script('info', `event type ${c.dataset.evt} ${c.checked ? 'recorded' : 'not recorded'}`); });
+      on(d, 'click', e => { const b = e.target.closest && e.target.closest('[data-evall]'); if (!b) return; if (b.dataset.evall === 'basic') { settings.eventsOff = basicOff(); for (const c of d.querySelectorAll('[data-evt]')) c.checked = evOn(c.dataset.evt); saveSettings(); dbg.script('info', 'event types: basic (default)'); return; }
+        const v = b.dataset.evall === '1';
+        for (const c of d.querySelectorAll('[data-evt]')) { c.checked = v; setEventType(c.dataset.evt, v); } saveSettings(); dbg.script('info', 'event types: ' + (v ? 'all recorded' : 'none recorded')); });
       on(tabsEl, 'click', e => { const s = e.target.closest('[data-subtab]'); if (!s) return; for (const x of tabsEl.children) x.classList.toggle('on', x === s); for (const p of d.querySelectorAll('[data-sub]')) p.style.display = p.dataset.sub === s.dataset.subtab ? '' : 'none'; });
       on(d, 'keydown', e => { const inp = e.target.closest && e.target.closest('[data-sckey]'); if (!inp) return; e.preventDefault(); e.stopPropagation(); const c = e.key === 'Backspace' ? '' : comboOf(e); if (c == null || (c === '' && e.key !== 'Backspace')) return;
         settings.shortcuts = Object.assign({}, settings.shortcuts || {}, { [inp.dataset.sckey]: c }); inp.value = c; saveSettings(); dbg.script('info', `shortcut ${inp.dataset.sckey} = ${c || '(none)'}`); });
@@ -3224,6 +3534,282 @@
     { const b = $('gxp-session'); b.style.cursor = 'pointer'; on(b, 'click', () => { if (session.state === 'expired') openSignIn(); else session.probe('manual'); }); }
     app.openSignIn = openSignIn; app.SIGNIN_URL = SIGNIN_URL;
     app.activeTab = () => activeTab;
+    /* ===================================================================
+     * 3.1.0  Events tab settings panel (on/off, mode, types, limit, auto-export on rollover) · Debug tab settings
+     *        (on/off, rows, dry run, form capture) · storage migration kick-off and progress
+     * =================================================================== */
+    /* ---------- apply settings to the tracker / debug log ---------- */
+    function applyLogSettings() {
+      tracker.loggingOn = settings.eventsOn !== false;
+      tracker.mode = settings.eventsMode === 'compact' ? 'compact' : 'standard';
+      dbg.setMinLevel(settings.debugOn === false ? 'error' : 'debug');
+      if (typeof applyRollBatch === 'function') applyRollBatch();
+    }
+    /* 3.1.1: auto-export batch size follows the row limit */
+    function applyRollBatch() { tracker.autoExport = !!settings.evAutoExport; }
+    applyRollBatch(); app.rollBatch = () => (tracker.autoExport ? tracker.rollBatch() : 0);
+
+    /* ---------- auto-export on rollover ---------- */
+    const pad2 = n => String(n).padStart(2, '0');
+    const localStamp = d => `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+    let lastRollName = '', rollSeq = 1, rollChain = Promise.resolve();
+    app.rollovers = [];
+    tracker.onTrim = rows => {
+      if (!settings.evAutoExport || !rows.length) return;
+      const batch = rows.slice(); // exactly the rows that leave memory: consecutive files never overlap or leave gaps
+      rollChain = rollChain.then(async () => {
+        let name = 'galaxy-console-events-' + localStamp(new Date()); if (name === lastRollName) name += '-' + (++rollSeq); else { lastRollName = name; rollSeq = 1; }
+        const parts = await tracker.exportEventsParts(batch); downloadParts(doc, name + '.csv', parts, 'text/csv;charset=utf-8');
+        app.rollovers.push({ name: name + '.csv', n: batch.length, first: batch[0].dk, last: batch[batch.length - 1].dk });
+        dbg.script('info', `events rollover: ${batch.length} events exported to ${name}.csv before leaving memory`);
+      }).catch(e => dbg.script('error', 'rollover export: ' + e.message));
+    };
+    app.rolloverDone = () => rollChain;
+
+    /* ---------- 3.1.2: Events and Debug settings live in the Settings dialog (sub-tabs 'Events' and 'Debug'; Debug only with
+     * developer tools on). The Events / Debug tab toolbars keep only their actions (exports, reset view). ---------- */
+    let EVP = null;
+    function evPanelHtml() {
+      const compact = settings.eventsMode === 'compact';
+      return `<fieldset><legend>Events settings</legend>
+        <label title="Turn event recording off completely (shuttle data is still kept and refreshed)"><input type="checkbox" data-es="eventsOn" ${settings.eventsOn !== false ? 'checked' : ''}> <b>Record events</b></label><br>
+        <label title="Standard: the event types ticked below. Compact: for every shuttle only departures (origin and destination), arrivals and cargo loaded / unloaded (product and quantity), with real time and the game's tu counter; enough for Trends, smallest storage.">Mode <select data-es="eventsMode"><option value="standard" ${compact ? '' : 'selected'}>Standard</option><option value="compact" ${compact ? 'selected' : ''}>Compact</option></select></label><br>
+        <label title="Newest events kept in memory for the Events tab, Trends and notifications (1,000 – 200,000; default 20,000). Saved history is not trimmed.">Rows kept <input type="number" data-lim="events" min="1000" max="200000" step="1000" value="${tracker.eventLimit}" style="width:90px"></label><br>
+        <label title="Each time the in-memory list rolls over, download the events that leave memory as galaxy-console-events-YYYYMMDD-HHMMSS.csv (local time): a continuous series of files while the console is open, without gaps or overlaps. One file every 1,000 events when Rows kept is 10,000 or less, every 10,000 events above that (memory may briefly hold Rows kept + one batch)."><input type="checkbox" data-es="evAutoExport" ${settings.evAutoExport ? 'checked' : ''}> Auto-export on rollover</label>
+        </fieldset><div class="gxp-evtypes" style="${compact ? 'opacity:.5' : ''}" title="${compact ? 'Not used in Compact mode' : ''}">${settingsEventsHtml()}</div>
+        <p class="gxp-approx">Export and "Reset view" buttons are in the Events tab.</p><span class="gxp-approx gxp-migr"></span>`;
+    }
+    const dbPanelHtml = () => `<label title="Off = only errors are logged (less work for the browser). The log keeps what it already has."><input type="checkbox" data-ds="debugOn" ${settings.debugOn !== false ? 'checked' : ''}> <b>Debug logging</b></label><br>
+      <label title="Newest debug log lines kept in memory (1,000 – 100,000; default 15,000). Older lines are dropped at once when lowered.">Rows kept <input type="number" data-lim="debug" min="1000" max="100000" step="1000" value="${dbg.limit()}" style="width:90px"></label><br>
+      <label title="3.1.5: byte budget of the debug log (5 – 4096 MB, default 500; last-resort safety net). Lines are capped at 64 KB text + 256 KB data; when the budget is reached the oldest lines go and debug-level lines stop being kept.">Debug memory budget <input type="number" data-mem="memDebugMB" min="5" max="4096" step="50" value="${settings.memDebugMB || 500}" style="width:70px"> MB</label><br>
+      <label title="3.1.5: byte budget of the events kept in memory (20 – 8192 MB, default 2048; last-resort safety net), on top of Rows kept. The oldest rows leave memory first (auto-exported first when the rollover auto-export is on); saved history is kept.">Events memory budget <input type="number" data-mem="memEventsMB" min="20" max="8192" step="100" value="${settings.memEventsMB || 2048}" style="width:70px"> MB</label><br>
+      <label title="Writes go through the normal confirmation but are NOT sent; the result shows the exact request"><input type="checkbox" data-ds="dryRun" ${settings.dryRun ? 'checked' : ''}> <b>Dry run</b></label><br>
+      <label title="Show the 'Capture … forms' buttons and record every write exchange for the developer"><input type="checkbox" data-ds="formCapture" ${settings.formCapture ? 'checked' : ''}> <b>Form capture</b></label>
+      <p class="gxp-approx">Export, copy and "Reset" buttons are in the Debug tab.</p>`;
+    function settingsLogExtras(d) {
+      const ev = d.querySelector('[data-sub=events]'), db = d.querySelector('[data-sub=debug]'), dtab = d.querySelector('[data-subtab=debug]');
+      if (!ev || !db) return;
+      EVP = ev; ev.innerHTML = evPanelHtml(); db.innerHTML = dbPanelHtml(); renderMigr();
+      if (dtab) { dtab.setAttribute('data-dev', '1'); dtab.style.display = settings.devTools ? '' : 'none'; }
+      on(ev, 'change', e => { const t = e.target, k = t.dataset.es;
+        if (k) { settings[k] = t.type === 'checkbox' ? t.checked : t.value; saveSettings(); applyLogSettings(); dbg.script('info', `events setting ${k} = ${settings[k]}`);
+          if (k === 'eventsMode') { const c = settings.eventsMode === 'compact', box = ev.querySelector('.gxp-evtypes'); box.style.opacity = c ? '.5' : ''; box.title = c ? 'Not used in Compact mode' : ''; } return; }
+        if (t.dataset.lim) { applyLimits(t.dataset.lim, t.value); t.value = tracker.eventLimit; } });
+      on(db, 'change', e => { const t = e.target, k = t.dataset.ds;
+        if (k) { settings[k] = t.checked; saveSettings(); applyLogSettings(); if (k === 'formCapture') applyDevTools(); dbg.script(k === 'debugOn' && !t.checked ? 'error' : 'info', `debug setting ${k} = ${t.checked}`); renderAll(); return; }
+        if (t.dataset.mem) { settings[t.dataset.mem] = Math.round(+t.value) || 0; saveSettings(); if (app.applyMemBudgets) app.applyMemBudgets(); t.value = t.dataset.mem === 'memDebugMB' ? Math.round(dbg.byteBudget() / 1048576) : Math.round(tracker.eventBytes / 1048576); dbg.script('info', `memory budget ${t.dataset.mem} = ${t.value} MB`); return; }
+        if (t.dataset.lim) { applyLimits(t.dataset.lim, t.value); t.value = dbg.limit(); } });
+      // developer tools switched in the same dialog: show / hide the Debug sub-tab at once
+      on(d, 'change', e => { if (e.target.dataset && e.target.dataset.s === 'devTools' && dtab) { dtab.style.display = settings.devTools ? '' : 'none'; const ds = db.querySelector('[data-ds=dryRun]'); if (ds) ds.checked = !!settings.dryRun; } });
+    }
+    app.openEventsSettings = () => { const d = app.openSettings('events'); return d && d.querySelector('[data-sub=events]'); };
+    evTab.bar.insertAdjacentHTML('beforeend', ' <span class="gxbutton gxp-btn" data-act="evSettings" role="button" tabindex="0" title="Open Settings › Events (recording on/off, mode, event types, rows kept, auto-export)">⚙ Settings</span>');
+    onBtn(evTab.bar.querySelector('[data-act=evSettings]'), () => app.openSettings('events'));
+    dbTab.bar.insertAdjacentHTML('beforeend', ' <span class="gxbutton gxp-btn" data-act="dbgSettings" role="button" tabindex="0" title="Open Settings › Debug (debug logging on/off, rows kept, dry run, form capture)">⚙ Settings</span>');
+    onBtn(dbTab.bar.querySelector('[data-act=dbgSettings]'), () => app.openSettings('debug'));
+    /** open Settings on a sub-tab ('events' | 'debug' | …) */
+    app.openSettings = sub => { const b = $('gxp-settings-btn'); if (!$('gxp-dialog')) b.click(); const d = $('gxp-dialog'); const t = d && d.querySelector(`[data-subtab=${sub || 'general'}]`); if (t && t.style.display !== 'none') t.click(); return d; };
+
+    /* ---------- storage migration (background, resumable) ---------- */
+    function renderMigr() { const m = tracker.migration, el = EVP && EVP.isConnected ? EVP.querySelector('.gxp-migr') : null; if (!el) return;
+      el.textContent = m.state === 'running' ? `Converting saved events to the compact storage format: ${fmtN(m.done)} of ${fmtN(m.total)}…` : m.state === 'done' ? `Saved events: compact storage (${fmtN(m.total)} converted).` : ''; }
+    tracker.subscribe(() => { renderMigr(); if (tracker.migration.state === 'running' && activeTab === 'events') evTab.count.textContent = `storage upgrade: ${fmtN(tracker.migration.done)} / ${fmtN(tracker.migration.total)} events converted`; });
+    setTimeout(() => tracker.migrateV2().catch(e => dbg.script('error', 'storage migration paused: ' + e.message + ' (resumes next start)')), opts.migrateDelayMs != null ? opts.migrateDelayMs : 8000);
+    /* ===================================================================
+     * 3.1.3  persistent sort / filter state (every tab) + per-tab "Reset filters" · Trends graph (in-console overlay, SVG)
+     * =================================================================== */
+    /* ---------- persistence: every filter control of every tab is saved in localStorage 'gxp.filters' as
+     * { <tab>: { <control key>: value } } and restored at start (by setting the value and firing the control's own
+     * input/change events, so each tab's existing filter code applies it). Dropdowns whose options appear later
+     * (owners, locations, stations) are re-tried every second until the option exists or the user picks something.
+     * Table sorts are kept by VTable itself (gxp.cols.<table>.sort). ---------- */
+    const FKEY = 'gxp.filters';
+    const fStore = (() => { const v = lsGet(FKEY, {}); return v && typeof v === 'object' ? v : {}; })();
+    const fSave = () => { try { W.localStorage.setItem(FKEY, JSON.stringify(fStore)); } catch (e) { /* */ } };
+    const FSEL = '[data-f],[data-tf],[data-tw],#gxp-trl-st,#gxp-trl-q';
+    const ckey = el => el.dataset.f ? 'f:' + el.dataset.f : el.dataset.tf ? 'tf:' + el.dataset.tf : el.dataset.tw != null ? 'tw' : el.id ? 'id:' + el.id : '';
+    const ctlVal = el => (el.type === 'checkbox' ? !!el.checked : el.value);
+    const panels = () => [...root.querySelectorAll('[id^=gxp-panel-]')].map(p => [p.id.slice(10), p]);
+    const ctls = p => [...p.querySelectorAll(FSEL)].filter(el => /^(INPUT|SELECT)$/.test(el.tagName) && el.type !== 'file' && ckey(el));
+    const fDefaults = {}; const fPending = new Map(); // el -> value still to apply
+    // defaults = what the markup declares (not the current value, which older code may already have restored)
+    const ctlDefault = el => el.type === 'checkbox' ? !!el.defaultChecked : el.tagName === 'SELECT' ? ((([...el.options].find(o => o.defaultSelected) || el.options[0]) || {}).value || '') : el.defaultValue;
+    for (const [k, p] of panels()) { fDefaults[k] = {}; for (const el of ctls(p)) fDefaults[k][ckey(el)] = ctlDefault(el); }
+    const fire = el => { el.dispatchEvent(new W.Event('input', { bubbles: true })); el.dispatchEvent(new W.Event('change', { bubbles: true })); };
+    const setCtl = (el, v) => { if (el.type === 'checkbox') { if (el.checked === !!v) return true; el.checked = !!v; fire(el); return true; }
+      if (el.tagName === 'SELECT' && ![...el.options].some(o => o.value === String(v))) return false; if (el.value === String(v)) return true; el.value = String(v); fire(el); return true; };
+    let fRestoring = false;
+    function fApply(only) {
+      fRestoring = true;
+      try { for (const [k, p] of panels()) { const st = fStore[k]; if (!st) continue; for (const el of ctls(p)) { const ck = ckey(el); if (!(ck in st)) continue; if (only && !only.has(el)) continue; if (setCtl(el, st[ck])) fPending.delete(el); else fPending.set(el, st[ck]); } } }
+      finally { fRestoring = false; }
+    }
+    for (const [k, p] of panels()) {
+      const save = e => { const el = e.target; if (fRestoring || !el.matches || !el.matches(FSEL) || el.type === 'file' || !ckey(el)) return; fPending.delete(el); (fStore[k] || (fStore[k] = {}))[ckey(el)] = ctlVal(el); fSave(); };
+      on(p, 'input', save); on(p, 'change', save);
+    }
+    fApply(); every(() => { if (fPending.size) fApply(new Set(fPending.keys())); }, 1000);
+    function resetFilters(k) {
+      const p = $('gxp-panel-' + k); if (!p) return; delete fStore[k]; fSave();
+      fRestoring = true; try { for (const el of ctls(p)) { fPending.delete(el); const d = (fDefaults[k] || {})[ckey(el)]; if (d !== undefined) setCtl(el, d); } } finally { fRestoring = false; }
+      const v = (app.vts || {})[k]; for (const t of v ? (v.list ? v.list() : [v]) : []) if (t && t.resetSort) t.resetSort();
+      dbg.script('info', `filters and sort of the ${k} tab reset`); renderAll();
+    }
+    app.resetFilters = resetFilters; app.filterStore = () => fStore;
+    for (const [k, p] of panels()) {
+      if (!ctls(p).length && !(app.vts || {})[k]) continue;
+      const bar = k === 'transport' ? ($('gxp-trl-q') || {}).parentNode : p.querySelector('.gxp-bar'); if (!bar) continue;
+      bar.insertAdjacentHTML('beforeend', ` <span class="gxbutton gxp-btn" data-act="fReset" data-ftab="${k}" role="button" tabindex="0" title="Reset this tab's filters, searches and sort to the defaults (they are otherwise kept across tabs and reloads)">Reset filters</span>`);
+      onBtn(bar.querySelector(`[data-ftab=${k}]`), () => resetFilters(k));
+    }
+
+    /* ---------- Trends graph: in-console overlay (no popup window: popups can be blocked, would need their own copy of
+     * the script / session, and the console must keep working standalone). Data = the cached hourly trend buckets only
+     * (app.trendNow(), maintained incrementally); redraws never read the database. ---------- */
+    const GDIMS = [['types', 'Events by type (count)'], ['products', 'Cargo loaded by product (quantity)'], ['routes', 'Trips by route (count)'], ['stations', 'Station / center activity (events)'], ['owners', 'Logbook events by owner (count)']];
+    const GKEY = 'gxp.graph', gDefault = () => ({ layers: [{ dim: 'types', inc: '', exc: '', top: 5, min: 0, sort: 'total' }], win: 86400000, game: false, norm: false, hidden: [], view: null });
+    let GS = Object.assign(gDefault(), lsGet(GKEY, {})); if (!Array.isArray(GS.layers) || !GS.layers.length) GS.layers = gDefault().layers;
+    const gSave = () => { try { W.localStorage.setItem(GKEY, JSON.stringify(GS)); } catch (e) { /* */ } };
+    const splitList = s => String(s || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+    /** series of one layer: filter (include / exclude substrings, min total), top-N by total, then sort (total | name) */
+    function graphSeries(tr, layer, win, nowT) {
+      const H = 3600000, from = Math.floor((nowT - win) / H) * H, hours = []; for (let h = from; h <= nowT; h += H) hours.push(h);
+      const idx = new Map(hours.map((h, i) => [h, i])), acc = new Map();
+      for (const [h, b] of Object.entries(tr || {})) { const i = idx.get(+h); if (i == null || !b) continue; for (const [n, v] of Object.entries(b[layer.dim] || {})) { let a = acc.get(n); if (!a) acc.set(n, a = new Array(hours.length).fill(0)); a[i] += +v || 0; } }
+      const inc = splitList(layer.inc), exc = splitList(layer.exc), min = +layer.min || 0, top = Math.max(0, +layer.top || 0);
+      let out = [...acc].map(([name, pts]) => ({ id: layer.dim + ':' + name, dim: layer.dim, name, pts, total: pts.reduce((x, y) => x + y, 0) }))
+        .filter(s => (!inc.length || inc.some(q => s.name.toLowerCase().indexOf(q) >= 0)) && !exc.some(q => s.name.toLowerCase().indexOf(q) >= 0) && s.total >= min && s.total > 0);
+      out.sort((a, b) => b.total - a.total || (a.name < b.name ? -1 : 1)); if (top) out = out.slice(0, top);
+      if (layer.sort === 'name') out.sort((a, b) => a.name.localeCompare(b.name));
+      return { hours, series: out };
+    }
+    app.graphSeries = graphSeries; app.graphState = () => GS;
+    const PAL = ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#9467bd', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f'];
+    function graphData() { const nowT = nowMs(); let hours = [], all = []; for (const L of GS.layers) { const r = graphSeries(app.trendNow(), L, GS.win, nowT); hours = r.hours; all = all.concat(r.series); } return { hours, series: all, nowT }; }
+    function graphSvg(dd) {
+      const Wd = 900, Ht = 380, ml = 56, mr = 12, mt = 10, mb = GS.game ? 46 : 30, pw = Wd - ml - mr, ph = Ht - mt - mb;
+      const t0 = dd.hours[0] || nowMs() - GS.win, t1 = dd.hours[dd.hours.length - 1] || nowMs();
+      const v = GS.view && GS.view.from < GS.view.to ? GS.view : { from: t0, to: Math.max(t1, t0 + 3600000) };
+      const X = t => ml + (t - v.from) / (v.to - v.from) * pw, vis = dd.series.filter(s => GS.hidden.indexOf(s.id) < 0);
+      const val = (s, i) => GS.norm ? (s._mx ? s.pts[i] / s._mx * 100 : 0) : s.pts[i];
+      let mx = 0; for (const s of vis) { s._mx = Math.max(...s.pts); dd.hours.forEach((h, i) => { if (h >= v.from - 3600000 && h <= v.to + 3600000) mx = Math.max(mx, val(s, i)); }); } mx = mx || 1;
+      const Y = y => mt + ph - y / mx * ph; let g = `<svg xmlns="http://www.w3.org/2000/svg" id="gxp-graph-svg" viewBox="0 0 ${Wd} ${Ht}" width="100%" style="max-height:60vh;background:#fff;cursor:grab;user-select:none" font-size="10" font-family="arial">`;
+      g += `<defs><clipPath id="gxp-gclip"><rect x="${ml}" y="${mt}" width="${pw}" height="${ph}"/></clipPath></defs>`;
+      for (let k = 0; k <= 4; k++) { const y = mx * k / 4; g += `<line x1="${ml}" x2="${ml + pw}" y1="${Y(y)}" y2="${Y(y)}" stroke="#eee"/><text x="${ml - 4}" y="${Y(y) + 3}" text-anchor="end">${GS.norm ? Math.round(y) + '%' : fmtN(Math.round(y))}</text>`; }
+      const span = v.to - v.from, step = [3600000, 3 * 3600000, 6 * 3600000, 12 * 3600000, 86400000].find(s => span / s <= 10) || 86400000;
+      const pad = n => String(n).padStart(2, '0'), tuS = (+settings.tuSeconds || 4) * 1000;
+      for (let t = Math.ceil(v.from / step) * step; t <= v.to; t += step) { const d = new Date(t), x = X(t);
+        g += `<line x1="${x}" x2="${x}" y1="${mt}" y2="${mt + ph}" stroke="#f2f2f2"/><text x="${x}" y="${mt + ph + 13}" text-anchor="middle">${step >= 86400000 || d.getHours() === 0 ? `${d.getMonth() + 1}/${d.getDate()} ` : ''}${pad(d.getHours())}:${pad(d.getMinutes())}</text>`;
+        if (GS.game) g += `<text x="${x}" y="${mt + ph + 26}" text-anchor="middle" fill="#666">${Math.round((t - dd.nowT) / tuS)} tu</text>`; }
+      g += `<text x="${ml + pw}" y="${Ht - 3}" text-anchor="end" fill="#666">local time${GS.game ? ' · game time: tu relative to now (≈' + (tuS / 1000) + ' s per tu, Settings)' : ''}</text>`;
+      g += `<rect x="${ml}" y="${mt}" width="${pw}" height="${ph}" fill="none" stroke="#999"/><g clip-path="url(#gxp-gclip)">`;
+      dd.series.forEach((s, si) => { s.color = PAL[si % PAL.length]; if (GS.hidden.indexOf(s.id) >= 0) return;
+        g += `<polyline fill="none" stroke="${s.color}" stroke-width="1.6" points="${dd.hours.map((h, i) => `${X(h + 1800000).toFixed(1)},${Y(val(s, i)).toFixed(1)}`).join(' ')}"><title>${esc(s.name)}</title></polyline>`; });
+      return g + '</g></svg>';
+    }
+    let GO = null;
+    function graphCtlHtml() {
+      const lay = GS.layers.map((L, i) => `<div data-gl="${i}" style="margin:2px 0">${i + 1}. <select data-g="dim" title="What to plot (from the recorded events)">${GDIMS.map(([k, l]) => `<option value="${k}" ${L.dim === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <input data-g="inc" value="${esc(L.inc)}" placeholder="include…" size="12" title="Only names containing one of these (comma-separated); empty = all">
+        <input data-g="exc" value="${esc(L.exc)}" placeholder="exclude…" size="12" title="Hide names containing any of these (comma-separated)">
+        top <input data-g="top" type="number" min="0" max="50" value="${L.top}" style="width:46px" title="Keep the N largest by total (0 = all)">
+        min <input data-g="min" type="number" min="0" value="${L.min}" style="width:60px" title="Hide series whose total in the window is below this">
+        <select data-g="sort" title="Legend order"><option value="total" ${L.sort !== 'name' ? 'selected' : ''}>by total</option><option value="name" ${L.sort === 'name' ? 'selected' : ''}>by name</option></select>
+        <span class="gxbutton gxp-btn" data-gact="del" role="button" tabindex="0" title="Remove this series group">×</span></div>`).join('');
+      return `<div class="gxp-bar"><b>Trends graph</b> <select data-gw title="Time window">${[[21600000, '6 hours'], [86400000, '24 hours'], [172800000, '2 days'], [345600000, '4 days']].map(([v, l]) => `<option value="${v}" ${GS.win === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <label title="Second axis row: game time in tu relative to now, converted with Settings › seconds per tu (approximate)"><input type="checkbox" data-gx="game" ${GS.game ? 'checked' : ''}> game time</label>
+        <label title="Scale every series to its own maximum (100 %), to compare shapes of very different sizes"><input type="checkbox" data-gx="norm" ${GS.norm ? 'checked' : ''}> scale each to 100 %</label>
+        <span class="gxbutton gxp-btn" data-gact="zin" role="button" tabindex="0" title="Zoom in (or mouse wheel on the graph)">+</span><span class="gxbutton gxp-btn" data-gact="zout" role="button" tabindex="0" title="Zoom out">−</span><span class="gxbutton gxp-btn" data-gact="zreset" role="button" tabindex="0" title="Show the whole window (drag the graph to pan)">⟲</span>
+        <span class="gxbutton gxp-btn" data-gact="add" role="button" tabindex="0" title="Overlay another series group">+ series group</span> <span class="gxbutton gxp-btn" data-gact="reset" role="button" tabindex="0" title="Back to the default graph selection">Reset</span> <span class="gxbutton gxp-btn" data-gact="close" role="button" tabindex="0" title="Close (selections are kept)">Close</span></div>
+        ${lay}<div id="gxp-graph-plot"></div><div id="gxp-graph-legend" style="margin-top:4px"></div><p class="gxp-approx">From the cached trend buckets (hourly, last 4 days); no database reads on redraw.</p>`;
+    }
+    function graphDraw() {
+      if (!GO) return; const dd = graphData(); $('gxp-graph-plot').innerHTML = dd.series.length ? graphSvg(dd) : '<p>No data for this selection yet.</p>';
+      $('gxp-graph-legend').innerHTML = dd.series.map(s => `<span data-gs="${esc(s.id)}" role="button" tabindex="0" title="Click to show / hide · total ${fmtN(s.total)}" style="cursor:pointer;margin-right:10px;white-space:nowrap;${GS.hidden.indexOf(s.id) >= 0 ? 'opacity:.35;text-decoration:line-through' : ''}"><i style="display:inline-block;width:12px;height:3px;vertical-align:middle;background:${s.color || '#999'}"></i> ${esc(s.name)} <span class="gxp-approx">(${fmtN(s.total)})</span></span>`).join('');
+      app.lastGraph = dd;
+    }
+    const zoom = (f, cx) => { const dd = app.lastGraph || graphData(); const t0 = dd.hours[0], t1 = dd.hours[dd.hours.length - 1] + 3600000; const v = GS.view || { from: t0, to: t1 };
+      const c = cx == null ? (v.from + v.to) / 2 : cx, span = Math.max(3600000, Math.min(t1 - t0, (v.to - v.from) * f)); let from = c - (c - v.from) * span / (v.to - v.from); from = Math.max(t0, Math.min(from, t1 - span));
+      GS.view = span >= t1 - t0 ? null : { from, to: from + span }; gSave(); graphDraw(); };
+    function openGraph() {
+      if (GO) { GO.remove(); GO = null; }
+      GO = doc.createElement('div'); GO.id = 'gxp-graph'; GO.setAttribute('role', 'dialog'); GO.setAttribute('aria-label', 'Trends graph');
+      GO.style.cssText = 'position:fixed;left:4%;top:5%;width:92%;max-height:90%;overflow:auto;background:#fff;border:1px solid #888;box-shadow:0 6px 24px rgba(0,0,0,.35);z-index:2147483000;padding:8px';
+      GO.innerHTML = graphCtlHtml(); root.appendChild(GO); graphDraw();
+      const upd = e => { const t = e.target, row = t.closest('[data-gl]');
+        if (row && t.dataset.g) { const L = GS.layers[+row.dataset.gl]; L[t.dataset.g] = t.type === 'number' ? +t.value || 0 : t.value; }
+        else if (t.dataset.gw != null) { GS.win = +t.value; GS.view = null; } else if (t.dataset.gx) GS[t.dataset.gx] = t.checked; else return;
+        gSave(); graphDraw(); };
+      on(GO, 'change', upd); on(GO, 'input', e => { if (e.target.dataset.g === 'inc' || e.target.dataset.g === 'exc') upd(e); });
+      on(GO, 'click', e => { const s = e.target.closest('[data-gs]'); if (s) { const id = s.dataset.gs, i = GS.hidden.indexOf(id); if (i >= 0) GS.hidden.splice(i, 1); else GS.hidden.push(id); gSave(); graphDraw(); return; }
+        const b = e.target.closest('[data-gact]'); if (!b) return; const a = b.dataset.gact;
+        if (a === 'close') { GO.remove(); GO = null; return; } if (a === 'zin') return zoom(0.5); if (a === 'zout') return zoom(2); if (a === 'zreset') { GS.view = null; gSave(); return graphDraw(); }
+        if (a === 'add') GS.layers.push({ dim: 'products', inc: '', exc: '', top: 5, min: 0, sort: 'total' });
+        else if (a === 'del') { GS.layers.splice(+b.closest('[data-gl]').dataset.gl, 1); if (!GS.layers.length) GS.layers = gDefault().layers; }
+        else if (a === 'reset') GS = gDefault();
+        gSave(); const keep = GO; keep.innerHTML = graphCtlHtml(); graphDraw(); });
+      const tAt = ev => { const svg = $('gxp-graph-svg'); if (!svg || !app.lastGraph) return null; const r = svg.getBoundingClientRect(), dd = app.lastGraph, v = GS.view || { from: dd.hours[0], to: dd.hours[dd.hours.length - 1] + 3600000 };
+        const x = (ev.clientX - r.left) / (r.width || 1) * 900; return v.from + (x - 56) / 832 * (v.to - v.from); };
+      on(GO, 'wheel', e => { if (!e.target.closest || !e.target.closest('#gxp-graph-svg')) return; e.preventDefault(); zoom(e.deltaY < 0 ? 0.8 : 1.25, tAt(e)); });
+      let drag = null; on(GO, 'pointerdown', e => { if (e.target.closest && e.target.closest('#gxp-graph-svg') && GS.view) drag = { x: e.clientX, v: Object.assign({}, GS.view) }; });
+      on(doc, 'pointermove', e => { if (!drag || !GO) return; const svg = $('gxp-graph-svg'); if (!svg) return; const dd = app.lastGraph, t0 = dd.hours[0], t1 = dd.hours[dd.hours.length - 1] + 3600000, span = drag.v.to - drag.v.from;
+        let from = drag.v.from - (e.clientX - drag.x) / ((svg.getBoundingClientRect().width || 900) * 832 / 900) * span; from = Math.max(t0, Math.min(from, t1 - span)); GS.view = { from, to: from + span }; graphDraw(); });
+      on(doc, 'pointerup', () => { if (drag) { drag = null; gSave(); } });
+      on(doc, 'keydown', e => { if (GO && e.key === 'Escape') { GO.remove(); GO = null; } });
+      return GO;
+    }
+    app.openGraph = openGraph;
+    { const bar = P('trends').querySelector('.gxp-bar'); if (bar) { bar.insertAdjacentHTML('beforeend', ' <span class="gxbutton gxp-btn" data-act="trGraph" role="button" tabindex="0" title="Open a graph that overlays series over time (event types, products, routes, stations, owners), with filters, legend and zoom">Graph…</span>'); onBtn(bar.querySelector('[data-act=trGraph]'), openGraph); } }
+    every(() => { if (GO) graphDraw(); }, 60000);
+    /* ===================================================================
+     * 3.1.5  memory safeguards: byte budgets (debug log, events in memory, logbooks, page cache), per-entry caps, periodic
+     * watchdog (performance.memory on Chromium, size estimates everywhere), warn once + status badge, never throws.
+     * =================================================================== */
+    const memMB = (k, dflt, lo, hi) => { const v = Math.round(+settings[k]); return Math.max(lo, Math.min(hi, v > 0 ? v : dflt)); };
+    const MB = 1048576;
+    function applyMemBudgets() {
+      dbg.setByteBudget(memMB('memDebugMB', MEM.DEBUG_BYTES / MB, MEM.DEBUG_BYTES_MIN / MB, MEM.DEBUG_BYTES_MAX / MB) * MB);
+      tracker.eventBytes = memMB('memEventsMB', MEM.EVENT_BYTES / MB, MEM.EVENT_BYTES_MIN / MB, MEM.EVENT_BYTES_MAX / MB) * MB; tracker.trimEvents(true);
+    }
+    const memState = { warned: {}, downgraded: false, last: null, notes: [] };
+    const badge = () => { const b = $('gxp-mem'); if (!b) return; const n = memState.notes; b.style.display = n.length ? '' : 'none'; b.textContent = n.length ? 'memory: trimmed' : ''; b.title = n.join('\n') + (n.length ? '\n(click to hide; Settings › Debug: memory budgets)' : ''); };
+    on($('gxp-mem'), 'click', () => { memState.notes = []; badge(); });
+    const warnOnce = (k, msg) => { if (memState.warned[k]) return; memState.warned[k] = true; memState.notes.push(msg); try { dbg.script('warn', 'memory: ' + msg); } catch (e) { /* */ } badge(); };
+    dbg.onBudget(() => {
+      warnOnce('debug', `debug log reached its ${Math.round(dbg.byteBudget() / MB)} MB budget: oldest lines dropped`);
+      // downgrade verbosity: debug-level lines are the bulk (per-request net lines); keep info and above until the user changes it
+      if (!memState.downgraded && dbg.minLevel() === 'debug') { memState.downgraded = true; dbg.setMinLevel('info'); dbg.script('warn', 'memory: debug log verbosity lowered to "info" (debug-level lines no longer kept); turn Debug logging off/on in Settings › Debug to restore'); }
+    });
+    tracker.onBudget = n => warnOnce('events', `events in memory reached ${Math.round(tracker.eventBytes / MB)} MB: ${n} oldest rows dropped from memory${tracker.autoExport ? ' (exported first by the rollover auto-export)' : ' (saved history is kept)'}`);
+    function memStats() {
+      const pm = W.performance && W.performance.memory, st = { at: Date.now(),
+        debug: dbg.stats(), events: { rows: tracker.events.length, bytes: tracker.evBytes, budget: tracker.eventBytes, byteTrims: tracker.evByteTrims },
+        logbooks: tracker.logbookBytes(), shuttles: tracker.ships.size, dict: tracker.dictSize ? tracker.dictSize() : null,
+        pageCache: app.pageCache ? { n: app.pageCache.size, bytes: app.pageCache.bytes } : null, pending: tracker.pendingEvents.length,
+        heap: pm ? { used: pm.usedJSHeapSize, total: pm.totalJSHeapSize, limit: pm.jsHeapSizeLimit } : null };
+      try { st.trends = estBytes(trend, 200000); } catch (e) { st.trends = null; }
+      try { st.marketHistory = { keys: Object.keys(mkHist).length, points: Object.values(mkHist).reduce((n, L) => n + (L ? L.length : 0), 0) }; } catch (e) { st.marketHistory = null; }
+      try { st.formCapture = fcap.length; } catch (e) { st.formCapture = null; }
+      st.estimatedTotal = st.debug.bytes + st.events.bytes + st.logbooks + ((st.pageCache && st.pageCache.bytes) || 0) + (st.trends || 0);
+      return st; }
+    function memWatch() {
+      try {
+        const st = memStats(); memState.last = st;
+        if (st.logbooks > MEM.LOGBOOK_BYTES) { const cut = tracker.trimLogbooks(MEM.LOGBOOK_BYTES); if (cut) warnOnce('logbooks', `shuttle logbooks in memory over ${MEM.LOGBOOK_BYTES / MB} MB: ${cut} oldest lines trimmed (each shuttle keeps at least ${MEM.LOGBOOK_MIN_KEEP})`); }
+        if (st.marketHistory && st.marketHistory.points > MEM.MKHIST_POINTS) { // drop the oldest points of the longest series
+          let over = st.marketHistory.points - MEM.MKHIST_POINTS; const keys = Object.keys(mkHist).sort((a, b) => mkHist[b].length - mkHist[a].length);
+          for (let r = 0; r < 10 && over > 0; r++) for (const k of keys) { if (over <= 0) break; const L = mkHist[k]; if (L.length > 5) { const n = Math.min(over, Math.ceil(L.length / 4)); L.splice(0, n); over -= n; } }
+          warnOnce('market', `market history over ${MEM.MKHIST_POINTS} points: oldest points dropped`); }
+        try { for (const b of Object.values(trend)) for (const d of ['routes', 'products', 'stations', 'types', 'owners']) { const o = b && b[d]; if (!o) continue; const ks = Object.keys(o); if (ks.length > MEM.TREND_KEYS) { ks.sort((x, y) => o[x] - o[y]); for (const k of ks.slice(0, ks.length - MEM.TREND_KEYS)) delete o[k]; warnOnce('trends', `trends: more than ${MEM.TREND_KEYS} keys in one hour bucket; smallest dropped`); } } } catch (e) { /* */ }
+        if (st.heap && st.heap.limit && st.heap.used > st.heap.limit * MEM.HEAP_WARN) { // Chromium: real heap pressure -> trim the big buffers to half their budget
+          const a = dbg.trimTo(0.5); const before = tracker.events.length, keep = Math.max(1000, Math.floor(before / 2)); if (before > keep) { const lim = tracker.eventLimit; tracker.eventLimit = keep; tracker.trimEvents(true); tracker.eventLimit = lim; }
+          if (app.pageCache) app.pageCache.clear(); tracker.trimLogbooks(MEM.LOGBOOK_BYTES / 2);
+          warnOnce('heap', `JS heap at ${Math.round(100 * st.heap.used / st.heap.limit)} % of its limit: debug log (${a} lines), events (${before - tracker.events.length} rows), page cache and logbooks trimmed`); }
+        dbg.script('debug', `memory: est. ${Math.round(st.estimatedTotal / MB)} MB (debug ${Math.round(st.debug.bytes / MB)}/${Math.round(st.debug.budget / MB)} MB ${st.debug.rows} rows, events ${Math.round(st.events.bytes / MB)}/${Math.round(st.events.budget / MB)} MB ${st.events.rows} rows, logbooks ${Math.round(st.logbooks / MB)} MB)` + (st.heap ? `; heap ${Math.round(st.heap.used / MB)}/${Math.round(st.heap.limit / MB)} MB` : ''), st);
+      } catch (e) { try { dbg.script('error', 'memory watchdog: ' + e.message); } catch (x) { /* never throw */ } }
+    }
+    applyMemBudgets(); every(memWatch, opts.memWatchMs || MEM.WATCH_MS); setTimeout(memWatch, opts.memFirstMs || 15000);
+    app.memStats = memStats; app.memWatch = memWatch; app.applyMemBudgets = applyMemBudgets; app.memState = memState;
     /* ---------- data: shuttle list ---------- */
     async function loadList() {
       try {
@@ -3281,9 +3867,16 @@
       if (!settings.autoDetails && selected == null) return;
       clearTimeout(pumpT); app.timers.delete(pumpT);
       const now = Date.now();
-      const rank = s => [s.id === selected ? 0 : 1, s.detailAt ? 1 : 0, isMine(s) ? 0 : 1, isActive(s) ? 0 : 1, s.nextDueAt || 0];
-      const due = [...tracker.ships.values()].filter(s => !s._hyd && (s.nextDueAt || 0) <= now && (settings.autoDetails || s.id === selected))
-        .map(s => [rank(s), s]).sort((x, y) => { for (let i = 0; i < 5; i++) if (x[0][i] !== y[0][i]) return x[0][i] - y[0][i]; return 0; }).map(x => x[1]);
+      /* 3.0.10: fair order. Before, own shuttles always sorted ahead of everyone else's; with ~950 shuttles the detail
+       * queue is saturated (≈3.5 reads/s), so other players' shuttles were read late or not at all and produced far fewer
+       * events. Now: selected first, then never-read, then most overdue first, with own and others' shuttles interleaved 1:1. */
+      const rank = s => [s.id === selected ? 0 : 1, s.detailAt ? 1 : 0, s.nextDueAt || 0];
+      const sorted = [...tracker.ships.values()].filter(s => !s._hyd && (s.nextDueAt || 0) <= now && (settings.autoDetails || s.id === selected))
+        .map(s => [rank(s), s]).sort((x, y) => { for (let i = 0; i < 3; i++) if (x[0][i] !== y[0][i]) return x[0][i] - y[0][i]; return 0; }).map(x => x[1]);
+      const mineQ = sorted.filter(s => isMine(s)), otherQ = sorted.filter(s => !isMine(s)), due = [];
+      if (sorted.length && sorted[0].id === selected) due.push(sorted[0]);
+      for (let i = 0; i < Math.max(mineQ.length, otherQ.length); i++) { for (const q of [mineQ, otherQ]) { const s = q[i]; if (s && s.id !== selected) due.push(s); } }
+      app.lastDetailOrder = due.map(s => s.id);
       while (inFlight < 2 && due.length) {
         const s = due.shift(); s._hyd = true; inFlight++;
         const prevAt = s.detailAt;
@@ -3440,7 +4033,7 @@
 
   W.GalaxyPlus = { VERSION, LIMITS, CADENCE, READ_METHODS, WRITE_METHODS, TRANSPORT_FIELDS, buildUrl, buildWriteUrl, cancelStep1Url, cancelStep2Url, findSubmitForm, parseFormTemplate, isConfirmationPage, writeResponseSummary, confirmTemplateFor, writeGate, RequestClient, ForbiddenRequestError, SessionExpiredError,
     parseShipsLayer, parseShipList, parseShipInfo, parseStations, parseMarkets, parseStationDocks, parseStationMarket, classifyLogLine, serverStamp, normName, parseMyDocks, parseTransportList, parseTransportInfo, classifyTransportRow, TR_STATUS, shipDiagnostics, routeOverview, parsePicker, parseGameMessage, classifyWriteMessage, parseLoadLine, originParams, detectOwnerFromText, shipDiagnostics, isLoginPage,
-    callArgs, csvParse, LRU, GxDB, MemDB, createTracker, createTransport, createSession, createDebug, transportValues, routeKey, mount, captureTransportForm, injectNextToExploreLinks, injectToolbarButton, injectLauncher, injectGadgetLauncher, keepLauncher, createTriggers, VTable, createTransport, statusOf,
+    callArgs, csvParse, LRU, MEM, estBytes, capStr, GxDB, MemDB, createTracker, createTransport, createSession, createDebug, transportValues, routeKey, mount, captureTransportForm, injectNextToExploreLinks, injectToolbarButton, injectLauncher, injectGadgetLauncher, keepLauncher, createTriggers, VTable, createTransport, statusOf,
     mapViewUrl, mapFragmentPath, parseMapHash, sanitizeMapFragment, headerMap, parseInventoryTable, parseLogTable, parseProductInfo, parseWorldInfo, worldMapUrl, worldCode, initials, serverStamp, serverTzOffsetMs, SERVER_TZ, EVENT_CSV_COLUMNS, SHIP_CSV_COLUMNS,
     scanActions, captureForms, parseFlightPlan, buildFlightUrl, flightSubmitProblem, buildLoaderUrl, buildRenameUrl, renameProblem, actionGate, CAPTURE_LOADERS, CAPTURE_RECORD_ONLY, DEFAULT_SETTINGS };
   if (W.__GXP_TEST__) return;
