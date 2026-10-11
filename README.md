@@ -10,6 +10,7 @@ This repo is a small toolkit for people who already play. It does not replace th
 
 | Script | Version | What it does |
 | --- | --- | --- |
+| [Galaxy Console.js](scripts/Galaxy%20Console.js) | 3.0 | CentauDos galaxy viewer and console: shuttle register, event log, flights, markets, docking, and gated writes |
 | [Loan Offers.js](scripts/Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
 | [Corporation Toolbox.js](scripts/Corporation%20Toolbox.js) | 2.4.1 | Unified sort/filter/select/apply for corporation lists and strategy forms |
 | [Trading Toolbox.js](scripts/Trading%20Toolbox.js) | 1.2.5 | Sort, filter, select, and bulk-edit country and enterprise trading pages |
@@ -44,6 +45,7 @@ This repo is a small toolkit for people who already play. It does not replace th
 
 Raw files:
 
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Galaxy%20Console.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Loan%20Offers.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Corporation%20Toolbox.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Trading%20Toolbox.js`
@@ -52,6 +54,65 @@ Raw files:
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter`
 
 Preferences are stored in Tampermonkey / `localStorage`. They stay on your machine.
+
+---
+
+## Galaxy Console
+
+**File:** [`Galaxy Console.js`](scripts/Galaxy%20Console.js)  
+**Userscript name:** Simcountry Galaxy Console  
+**Author:** TheWalkingGlitch  
+**Runs on:** the CentauDos galaxy root (`cgi2nova?SN_METHOD=gxRoot`) and related pages. Opens its own viewer window; a launcher button is injected on the main portal gadget.
+
+Galaxy Console (formerly Galaxy+) is a full CentauDos viewer and console. It builds a local shuttle register and event log (IndexedDB, with CSV import/export), lists shuttles/stations/markets/docks, tracks flights, supports rename and bulk rename, and can submit transport requests. Writes are OFF by default and each write is confirmed against a captured live form. It also renders country/world map fragments as a normal page when opened with a map hash.
+
+![Galaxy Console shuttle list and map on the CentauDos viewer](readmescreenshots/GalaxyConsole%20Example%20Screenshot.png)
+*Galaxy Console shuttle list and map on the CentauDos viewer.*
+
+### Features
+
+- Virtualized shuttle table with filters (name, owner, place, status, location), column modes, and bulk rename
+- Shuttle register and event log stored in IndexedDB (CSV in/out); logbook lines accumulated per shuttle
+- Stations, markets, docking lists, and shuttle flights with cadence-based refresh (active / idle / stale)
+- Transport requests: staged queue, origins/targets/products pickers, form capture so the posted fields match the live form; writes gated (master switch + family switch + ownership, OFF by default)
+- Rename (single and bulk) with the same gates
+- Map viewer: same-origin map fragments rendered in-page with navigation stripped of scripts
+- Launcher: button on the Worlds & Space Travel gadget (or a floating panel) that opens the console window
+- Debug ring, request client with allowlists, session keepalive, and settings for every list length and cadence
+- Notifications for arrivals (optional desktop + sound)
+
+Nothing is written until you enable the relevant switches and confirm each action. The original game pages are only read (plus the added launcher button).
+
+---
+
+## World maps
+
+**Files:** [`World Maps/`](World%20Maps) — one self-contained HTML page per world, generator `Simcountry shaded world map 3.0.0`  
+**Author:** TheWalkingGlitch  
+**Runs on:** your browser, offline. These are saved snapshots, not a userscript, and they do not call the game when you open them.
+
+Each file is a shaded whole-world map from the morning of 9 Oct 2026 (Central). Download the HTML and open it locally. The page draws the map, a zoom bar, and a side panel. Search matches country name, country number, or president. Continent and region buttons jump the view. Hover a country for the tip. Dashed boxes are regions placed approximately.
+
+![Shaded world map viewer on a saved Simcountry world render](readmescreenshots/Screenshot_20261009_164146.png)
+*Shaded world map viewer on a saved Simcountry world render.*
+
+### Snapshots
+
+- [Fearless Blue](World%20Maps/simcountry-fearless-blue-world-20261009-0556.html) — `sim02`, saved 05:56
+- [White Giant](World%20Maps/simcountry-white-giant-world-20261009-0549.html) — `sim03`, saved 05:49
+- [Golden Rainbow](World%20Maps/simcountry-golden-rainbow-world-20261009-0544.html) — `sim04`, saved 05:44
+- [Kebir Blue](World%20Maps/simcountry-kebir-blue-world-20261009-0600.html) — `sim01`, saved 06:00
+- [Little Upsilon](World%20Maps/simcountry-little-upsilon-world-20261009-0604.html) — `sim05`, saved 06:04
+- [Tiny Atlas](World%20Maps/simcountry-tiny-atlas-world-20261009-0607.html) — `sim06`, saved 06:07
+
+### How to use
+
+- Download the HTML file (GitHub's raw view is fine) and open it in a browser. No server, no login.
+- **− / +**, **Fit**, and **100%** set the zoom. Ctrl+wheel does the same.
+- The search box is "Find country / number / president".
+- The side panel lists world, game date, host, build time, how many countries were traced, and regions. Continents and regions are buttons.
+- The status line is the snapshot: world, in-game date, country and region counts, and when it was saved.
+- These pages are finished outputs. See License. They are not covered by the Unlicense.
 
 ---
 
@@ -245,49 +306,20 @@ Screenshot: none yet.
 
 ---
 
-## World maps
-
-**Files:** [`World Maps/`](World%20Maps) — one self-contained HTML page per world, generator `Simcountry shaded world map 3.0.0`  
-**Author:** TheWalkingGlitch  
-**Runs on:** your browser, offline. These are saved snapshots, not a userscript, and they do not call the game when you open them.
-
-Each file is a shaded whole-world map from the morning of 9 Oct 2026 (Central). Download the HTML and open it locally. The page draws the map, a zoom bar, and a side panel. Search matches country name, country number, or president. Continent and region buttons jump the view. Hover a country for the tip. Dashed boxes are regions placed approximately.
-
-![Shaded world map viewer on a saved Simcountry world render](readmescreenshots/Screenshot_20261009_164146.png)
-*Shaded world map viewer on a saved Simcountry world render.*
-
-### Snapshots
-
-- [Fearless Blue](World%20Maps/simcountry-fearless-blue-world-20261009-0556.html) — `sim02`, saved 05:56
-- [White Giant](World%20Maps/simcountry-white-giant-world-20261009-0549.html) — `sim03`, saved 05:49
-- [Golden Rainbow](World%20Maps/simcountry-golden-rainbow-world-20261009-0544.html) — `sim04`, saved 05:44
-- [Kebir Blue](World%20Maps/simcountry-kebir-blue-world-20261009-0600.html) — `sim01`, saved 06:00
-- [Little Upsilon](World%20Maps/simcountry-little-upsilon-world-20261009-0604.html) — `sim05`, saved 06:04
-- [Tiny Atlas](World%20Maps/simcountry-tiny-atlas-world-20261009-0607.html) — `sim06`, saved 06:07
-
-### How to use
-
-- Download the HTML file (GitHub's raw view is fine) and open it in a browser. No server, no login.
-- **− / +**, **Fit**, and **100%** set the zoom. Ctrl+wheel does the same.
-- The search box is "Find country / number / president".
-- The side panel lists world, game date, host, build time, how many countries were traced, and regions. Continents and regions are buttons.
-- The status line is the snapshot: world, in-game date, country and region counts, and when it was saved.
-- These pages are finished outputs. See License. They are not covered by the Unlicense.
-
----
-
 ## Repository layout
 
 ```
 Simcountry/
 ├── scripts/
 │   ├── Corporation Toolbox.js
+│   ├── Galaxy Console.js
 │   ├── Loan Offers.js
 │   ├── Portal.js
 │   ├── Profession Toolbox.js
 │   ├── Simcountry Cash Log — endless, sort, filter
 │   └── Trading Toolbox.js
 ├── readmescreenshots/
+│   ├── GalaxyConsole Example Screenshot.png
 │   ├── LoanOffersjs Example Screenshot.png
 │   ├── Portaljs Example Screenshot.png
 │   ├── Salary Toolbox SS.png
@@ -317,6 +349,7 @@ Simcountry/
 - These scripts scrape and click the live site. A game update can break them overnight.
 - They are client-side only. They do not talk to a third-party server.
 - First-party userscripts live under `scripts/`.
+- Galaxy Console keeps a local shuttle register and event log in IndexedDB. Writes (rename, flights, cargo, docking, trade, transports) are OFF by default and require an explicit confirm against a captured live form.
 - Batch loan submits reload the offer page once per offer, with a delay. Do not walk away from a 50-offer job if you care about the result.
 - Corporation, trading, and profession revisions / bookmarks / presets live in userscript storage. Export nothing you cannot rebuild.
 - Portal sort order is local to that browser. It will not follow you to another machine.
