@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simcountry Galaxy Console
 // @namespace    https://simcountry.com/galaxy-plus
-// @version      3.0
+// @version      3.0.7
 // @description  Galaxy Console (formerly Galaxy+): CentauDos viewer and console. Shuttle register + event log (IndexedDB, CSV in/out), shuttle/station/market/docking lists, shuttle flights, rename and bulk rename, transport requests (writes OFF by default, each confirmed).
 // @author       TheWalkingGlitch
 // @match        https://www.simcountry.com/cgi-bin/cgi2nova*
@@ -12,7 +12,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  const VERSION = '3.0';
+  const VERSION = '3.0.7';
   const W = window;
 
   /* ===================================================================
@@ -128,8 +128,10 @@
     jxShipRename:          { script: 'cgip', fields: ['miShipID', 'miObjectName'], family: 'rename' },
   });
   const ID_RE = /^\d{1,30}$/;
+  /* 3.0.5: transport keys are alphanumeric in the live game (e.g. 26 chars), not numeric: the old ID_RE check blocked every cancel. */
+  const TR_KEY_RE = /^[A-Za-z0-9_-]{1,64}$/;
   /** Step 1 of cancel: exactly the URL the red X loads. */
-  function cancelStep1Url(id) { if (!ID_RE.test(String(id))) throw new ForbiddenRequestError('bad transport id'); return '/cgi-bin/cgip?gxDelTransportRequest&miKey=' + id; }
+  function cancelStep1Url(id) { if (!TR_KEY_RE.test(String(id))) throw new ForbiddenRequestError('bad transport id'); return '/cgi-bin/cgip?gxDelTransportRequest&miKey=' + id; }
   /** Step 2 of cancel: the confirmation form returned by step 1, serialized like deskform_getpostlist (DOM order, 'mi' fields, unchecked boxes skipped). */
   function cancelStep2Url(template, id) {
     if (!template || template.method !== 'gxDelTransportRequest') throw new ForbiddenRequestError('confirmation form does not submit gxDelTransportRequest');
@@ -362,19 +364,20 @@
       if (!gate || !gate.ok) throw new ForbiddenRequestError('write gate closed: ' + (gate ? gate.why : 'no gate'));
       const dyn = gate.flightMethod && gate.flightMethod === method && !flightSubmitProblem(method) && url.indexOf('/cgi-bin/cgip?' + method + '&') === 0; // 0.2.7 live flight form submit
       if (!dyn && (!Object.prototype.hasOwnProperty.call(WRITE_METHODS, method) || url.indexOf('/cgi-bin/' + WRITE_METHODS[method].script + '?' + method + '&') !== 0)) throw new ForbiddenRequestError('write URL does not match allowlisted method ' + method);
-      if (typeof this.dryRun === 'function' && this.dryRun()) { this.stats.dryRuns = (this.stats.dryRuns || 0) + 1; this.dbg.net('info', `DRY RUN ${method}${note ? ' (' + note + ')' : ''}: not sent`, { url }); throw new DryRunError(method, url); }
+      if (typeof this.dryRun === 'function' && this.dryRun()) { this.stats.dryRuns = (this.stats.dryRuns || 0) + 1; this.dbg.net('info', `DRY RUN ${method}${note ? ' (' + note + ')' : ''}: not sent`, { url }); if (typeof this.onWrite === 'function') try { this.onWrite({ method, note, url, dryRun: true }); } catch (x) { /* */ } throw new DryRunError(method, url); }
       this.stats.writes++;
       const sent = url.split('&').slice(1).map(p => p.split('=')[0]);
       try {
         const r = await this._once(url, 30000, null);
         const summary = writeResponseSummary(r.body);
         // full response kept in the debug entry (export it from the Debug tab for analysis)
+        if (typeof this.onWrite === 'function') try { this.onWrite({ method, note, url, status: r.status, ms: r.ms, response: r.body }); } catch (x) { /* capture must never break a write */ }
         this.dbg.net(r.ok ? 'info' : 'error', `WRITE ${method}${note ? ' (' + note + ')' : ''} ${r.status} ${r.ms}ms ${r.body.length}B: ${summary}`, { fieldsSent: sent, url, response: r.body });
         if (!r.ok) throw new HttpError(r.status);
         if (isLoginPage(r.body)) { this.onSession('expired', method); throw new SessionExpiredError(); }
         return r.body;
       } catch (e) {
-        if (e.name !== 'HttpError' && e.name !== 'SessionExpiredError') this.dbg.net('error', `WRITE ${method} failed: ${e.message}`, { fieldsSent: sent, url });
+        if (e.name !== 'HttpError' && e.name !== 'SessionExpiredError') { this.dbg.net('error', `WRITE ${method} failed: ${e.message}`, { fieldsSent: sent, url }); if (typeof this.onWrite === 'function') try { this.onWrite({ method, note, url, error: e.message }); } catch (x) { /* */ } }
         throw e;
       } finally { this._emit(); }
     }
@@ -574,7 +577,10 @@
       return { id: id == null ? null : String(id), key: id == null ? null : String(id), product: r['Product Name'] || '', productId: (callArgs(h, 'gxProductInfo') || [])[0],
         quantity: num(r.Quantity), origin: r['Origin (From)'] || '', target: r['Target (To)'] || '', loaded: num(ld[1]), delivered: num(ld[2]), loadedText: r['Loaded / Delivered'] || '',
         status: st.kind, pct: st.pct == null ? null : st.pct, statusLabel: TR_STATUS[st.kind].label + (st.kind === 'transit' && st.pct != null ? ' ' + st.pct + '%' : ''),
-        cancelable: /gxDelTransportRequest/.test(h) };
+        cancelable: /gxDelTransportRequest/.test(h),
+        /* 3.0.5: the red X's own key (3rd argument of gxDelTransportRequest) is what the game sends as miKey */
+        cancelKey: (() => { const a = callArgs(h, 'gxDelTransportRequest'); return a && a[2] != null && String(a[2]) !== '' ? String(a[2]) : (id == null ? null : String(id)); })(),
+        productIcon: (() => { const m = /<img[^>]+src=["']([^"']+\.(?:gif|png|jpe?g|webp))["']/i.exec(h); if (!m) return ''; const u = m[1].replace(/&amp;/g, '&'); return /^(https:\/\/[a-z0-9.-]*simcountry\.com\/|\/)/i.test(u) ? (u[0] === '/' ? 'https://www.simcountry.com' + u : u) : ''; })() };
     }) };
   }
   /** gxTransportInfo popup: label/value pairs + logbook rows. */
@@ -928,6 +934,8 @@
     T.recordLogbook = recordLogbook;
     /** 0.2.6: every Galaxy Console write lands in the event register (and so in the events CSV). */
     T.addWriteEvent = (s, action, from, to, outcome, url) => { pushEvent(s, 'write_' + action, from, to, 'galaxyplus-write', null, { note: outcome + ' ' + url }); T.dirty.add(s.id); };
+    /** 3.0.4: transport cancel writes go to the events log/CSV (pseudo ship id "transport:<id>"). */
+    T.addTransportWriteEvent = (row, id, outcome, msg) => { pushEvent({ id: 'transport:' + id, name: row ? `${row.quantity} ${row.product} ${row.origin} -> ${row.target}` : '', owner: '' }, 'write_cancel_transport', row ? row.statusLabel : '', outcome, 'galaxyplus-write', null, { note: outcome + (msg ? ': ' + msg : '') + ' /cgi-bin/cgip?gxDelTransportRequest&miKey=' + id }); };
     /** Apply data from a source; diff tracked fields; append events. */
     T.observe = (id, patch, source) => {
       let s = T.ships.get(id), isNew = false;
@@ -956,7 +964,7 @@
       }
       s.status = statusOf(s);
       if (source === 'layer' || source === 'list' || source === 'detail') { s.lastSeen = now(); s.lastSeenSession = T.session; }
-      if (source === 'list') s.inList = true;
+      if (source === 'list') { s.inList = true; if (patch.location) s.listLocation = patch.location; } // 3.0.1: planet name as the list shows it (location normalisation)
       s.stale = !(s.onMap || s.inList);
       const snap = {}; for (const k of TRACKED) snap[k] = norm(s[k]);
       if (isNew || !s.snap) { if (source !== 'import') pushEvent(s, 'registered', '', source, source); }
@@ -1322,8 +1330,13 @@
       const it = { qid: 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: Date.now(), origin, target, product, quantity: q, status: 'draft', issues: [], message: '' };
       X.queue.push(it); X.validate(); await save(); dbg.script('info', `queued transport: ${q} ${product.name} ${origin.name} -> ${target.name}`); return it;
     };
-    X.remove = async qid => { X.queue = X.queue.filter(i => i.qid !== qid); X.validate(); await save(); };
-    X.clearDone = async () => { X.queue = X.queue.filter(i => ['submitted', 'skipped-duplicate'].indexOf(i.status) < 0); await save(); emit(); };
+    /* 3.0.6: removal updates memory and notifies synchronously (UI redraws at once); persistence follows. */
+    X.remove = async qid => { const n = X.queue.length; X.queue = X.queue.filter(i => i.qid !== qid); if (X.queue.length !== n) dbg.script('info', 'queue item removed: ' + qid); X.validate(); emit(); await save(); };
+    X.isDone = i => ['submitted', 'skipped-duplicate'].indexOf(i.status) >= 0;
+    X.clearDone = async () => { X.queue = X.queue.filter(i => !X.isDone(i)); emit(); await save(); };
+    /* 3.0.6: finished items leave the queue shortly after the send completes (results stay in the Results log). */
+    X.autoClearMs = 3000; let acT = null;
+    const scheduleAutoClear = () => { if (acT) clearTimeout(acT); if (!X.queue.some(X.isDone) || !(X.autoClearMs >= 0)) return; acT = setTimeout(() => { acT = null; if (!X.running) X.clearDone(); else scheduleAutoClear(); }, X.autoClearMs); };
     X.preview = it => buildWriteUrl('gxAddTransportRequest', transportValues(it), it.confirmTemplate || X.template);
     /** The server answered with a confirmation form: the user confirms explicitly; the item is re-sent only by the next user-pressed Submit all. */
     X.confirmItem = async qid => { const it = X.queue.find(i => i.qid === qid); if (!it || it.status !== 'needs-confirm') return; it.status = 'valid'; it.confirmed = true; it.message = 'confirmed by you: will be re-sent with the confirmation form on the next Submit all'; await save(); emit(); };
@@ -1360,36 +1373,44 @@
           else { it.status = 'failed'; it.errorKind = cls === 'rejected' ? 'rejected' : 'unconfirmed'; log(it, 'failed', msg || 'no message, and the request did not appear in the re-read transport list'); if (o.settings().stopOnError) break; }
           emit();
         }
-      } finally { X.running = false; await save(); emit(); }
+      } finally { X.running = false; await save(); emit(); scheduleAutoClear(); }
     };
     /* ---------- cancel (second gated write) ---------- */
     X.cancelGate = () => o.settings().writesEnabled ? { ok: true, why: 'cancel flow from gxDelTransportRequest/gxTransportForm code' } : { ok: false, why: 'Writes are OFF (Settings).' };
     X.cancelResults = [];
     const isCancelable = r => r && r.cancelable && TR_STATUS[r.status].active;
+    /* 3.0.4: own active transports may be cancelled even when the game shows no red X (already underway): the request is
+     * sent once and the game's reply is shown verbatim. Finished / aborted rows are skipped. The batch always stops at the
+     * first failure (user-approved design), whatever the general stop-on-error setting. */
+    X.canTryCancel = r => !!(r && r.id && TR_STATUS[r.status] && TR_STATUS[r.status].active);
+    const replyText = body => { try { const m = parseGameMessage(body); if (m) return m; return txt(parseDoc(body)).replace(/\s+/g, ' ').trim().slice(0, 400); } catch (e) { return ''; } };
     X.cancelSelected = async (ids, onItem) => {
       if (X.running) return; const gate = X.cancelGate(); if (!gate.ok) throw new ForbiddenRequestError(gate.why);
       X.running = true; emit(); const out = [];
       const done = (id, row, outcome, msg) => { const r = { t: Date.now(), id, product: row ? row.product : '', quantity: row ? row.quantity : null, origin: row ? row.origin : '', target: row ? row.target : '', outcome, message: msg || '' };
-        out.push(r); X.cancelResults.push(r); X.results.push(Object.assign({ qid: 'cancel:' + id }, r)); dbg.script(outcome === 'cancelled' ? 'info' : 'warn', `cancel ${id} ${outcome}: ${msg || ''}`); if (onItem) onItem(r); emit(); return r; };
+        out.push(r); X.cancelResults.push(r); X.results.push(Object.assign({ qid: 'cancel:' + id }, r)); dbg.script(outcome === 'cancelled' ? 'info' : 'warn', `cancel ${id} ${outcome}: ${msg || ''}`); if (outcome !== 'dry-run' && tracker.addTransportWriteEvent) tracker.addTransportWriteEvent(row, id, outcome, msg); if (onItem) onItem(r); emit(); return r; };
       try {
         for (const id of ids) {
-          let live; try { live = await X.readLive(); } catch (e) { const r = done(id, null, 'failed', 'could not re-read transport list: ' + e.message); if (o.settings().stopOnError) break; else continue; }
+          let live; try { live = await X.readLive(); } catch (e) { const r = done(id, null, 'failed', 'could not re-read transport list: ' + e.message); break; }
           const row = live.find(r => r.id === String(id));
           if (!row) { done(id, null, 'skipped-gone', 'no longer in the transport list'); continue; }
-          if (!isCancelable(row)) { done(id, row, 'skipped-not-cancelable', 'status is ' + row.statusLabel + ', no cancel in the game'); continue; }
+          if (!X.canTryCancel(row)) { done(id, row, 'skipped-not-cancelable', 'status is ' + row.statusLabel + ': nothing to cancel'); continue; }
+          const underway = !isCancelable(row);
           let body, msg;
           try {
-            body = await client.writeUrl('gxDelTransportRequest', cancelStep1Url(id), X.cancelGate(), 'step 1: open confirmation');
-            msg = parseGameMessage(body);
+            const ck = row.cancelKey || row.id;
+            body = await client.writeUrl('gxDelTransportRequest', cancelStep1Url(ck), X.cancelGate(), 'step 1: open confirmation');
+            msg = replyText(body);
             const form = findSubmitForm(body, 'gxDelTransportRequest');
             if (form && !/^Sorry\./i.test(msg || '')) { // the game's modal asks "Abort this Transport?": the user already confirmed in our review dialog
-              body = await client.writeUrl('gxDelTransportRequest', cancelStep2Url(confirmTemplateFor(form), id), X.cancelGate(), 'step 2: confirm'); msg = parseGameMessage(body);
+              body = await client.writeUrl('gxDelTransportRequest', cancelStep2Url(confirmTemplateFor(form), ck), X.cancelGate(), 'step 2: confirm'); msg = replyText(body);
             }
-          } catch (e) { if (e.name === 'DryRunError') { done(id, row, 'dry-run', e.message); continue; } done(id, row, 'failed', e.name === 'TimeoutError' ? 'no answer within 30 s: outcome UNKNOWN, check the list' : e.message); if (o.settings().stopOnError || e.name === 'TimeoutError') break; else continue; }
+          } catch (e) { if (e.name === 'DryRunError') { done(id, row, 'dry-run', e.message); continue; }
+            if (e.name === 'ForbiddenRequestError' && client.onWrite) client.onWrite({ method: 'gxDelTransportRequest', note: 'blocked before sending (transport ' + id + ')', blocked: e.message, row }); done(id, row, 'failed', e.name === 'TimeoutError' ? 'no answer within 30 s: outcome UNKNOWN, check the list' : e.message); break; }
           let after = null; try { after = await X.readLive(); } catch (e) { after = null; }
           const now = after && after.find(r => r.id === String(id));
           if (after && (!now || now.status === 'aborted')) done(id, row, 'cancelled', msg || (now ? 'status now Aborted' : 'row gone from the list'));
-          else { done(id, row, 'failed', msg || (after ? 'row still present as ' + now.statusLabel : 'could not re-read the list to confirm')); if (o.settings().stopOnError) break; }
+          else { done(id, row, 'failed', (underway ? 'already underway; game replied: ' : '') + (msg || (after ? 'row still present as ' + now.statusLabel : 'could not re-read the list to confirm'))); break; }
         }
       } finally { X.running = false; await save(); emit(); }
       return out;
@@ -1450,7 +1471,9 @@
     let widths = {}, lastAvail = -1;
     function layout(force) {
       const avail = Math.max(0, sc.clientWidth || host.clientWidth || 0); if (!force && avail === lastAvail) return; lastAvail = avail;
-      const w = {}; for (const c of cols) w[c.key] = hid(c.key) ? 0 : Math.round(Math.max(c.min, Math.min(c.max, avail * c.weight / 100)));
+      /* 3.0.5: shares are normalised over the VISIBLE columns (weights summing to more than 100 % made tables wider than the pane) */
+      const wsum = cols.reduce((a, c) => a + (hid(c.key) ? 0 : c.weight), 0) || 100;
+      const w = {}; for (const c of cols) w[c.key] = hid(c.key) ? 0 : Math.round(Math.max(c.min, Math.min(c.max, avail * c.weight / wsum)));
       if (lay.mode === 'fixed') { for (const c of cols) if (lay.w[c.key] && !hid(c.key)) w[c.key] = lay.w[c.key]; }
       else { let spare = avail - cols.reduce((a, c) => a + w[c.key], 0); if (spare > 0) { const vc = cols.filter(c => !hid(c.key)), g = vc.filter(c => c.grow).length ? vc.filter(c => c.grow) : vc.filter(c => !c.num).length ? vc.filter(c => !c.num) : vc; const tw = g.reduce((a, c) => a + c.weight, 0) || 1;
         for (const c of g) w[c.key] += Math.floor(spare * c.weight / tw); } }
@@ -1506,9 +1529,11 @@
       tbl.style.transform = `translateY(${first * R}px)`;
       const focusK = doc.activeElement && doc.activeElement.dataset && doc.activeElement.dataset.k;
       let h = '';
+      /* 3.0.2: one broken cell must not stop the whole table from redrawing */
+      const cellHtml = (c, r) => { try { return c.html ? c.html(r) : esc(r[c.key]); } catch (e) { if (!cellHtml.warned) { cellHtml.warned = 1; try { console.warn('cell ' + c.key + ': ' + e.message); } catch (x) { /* */ } } return ''; } };
       for (let i = first; i < last; i++) { const r = t.rows[i], k = o.rowKey(r);
         h += `<tr data-k="${esc(k)}" data-i="${i}" tabindex="0" class="gxpu_rc${i % 2}${k === t.selectedKey ? ' sel' : ''}${o.rowClass ? ' ' + o.rowClass(r) : ''}" style="height:${R}px">` +
-          cols.map(c => hid(c.key) ? '<td class="gxp-hidc"></td>' : `<td class="gxpu_data${c.num ? ' n' : ''}" title="${esc(c.title ? c.title(r) : '')}">${c.html ? c.html(r) : esc(r[c.key])}</td>`).join('') + '</tr>'; }
+          cols.map(c => hid(c.key) ? '<td class="gxp-hidc"></td>' : `<td class="gxpu_data${c.num ? ' n' : ''}" title="${esc(c.title ? c.title(r) : '')}">${cellHtml(c, r)}</td>`).join('') + '</tr>'; }
       if (h === lastHtml && tb.childElementCount) return; lastHtml = h; tb.innerHTML = h;
       if (focusK) { const f = tb.querySelector(`tr[data-k="${(W.CSS && W.CSS.escape ? W.CSS.escape(focusK) : String(focusK).replace(/["\\]/g, '\\$&'))}"]`); if (f) f.focus({ preventScroll: true }); }
     }
@@ -1573,6 +1598,9 @@
     .gxp-bar-pct>i{display:block;height:100%;background:#2f7d32}
     .gxp-st{font-weight:bold;white-space:nowrap}
     .gxp-host-fixed{height:260px;display:flex;flex-direction:column}
+    .gxp-pn,.gxp-pn a,.gxp-pn a:link,.gxp-pn a:visited{color:#000!important;font-weight:bold}.gxp-pi{width:16px;height:16px;vertical-align:-3px;margin-right:4px;border:0}
+    .gxp-hh-host{position:relative}.gxp-host-fixed>.gxp-vt,.gxp-tr-grid .gxp-host>.gxp-vt{flex:1 1 auto;min-height:0}.gxp-tr-grid .gxp-host{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}.gxp-hh{position:absolute;left:0;right:0;bottom:-5px;height:5px;cursor:row-resize;z-index:4;background:linear-gradient(transparent 2px,rgba(89,98,79,.18) 2px,rgba(89,98,79,.18) 3px,transparent 3px)}
+    .gxp-hh:hover,.gxp-hh.on{background:linear-gradient(transparent 2px,rgba(89,98,79,.55) 2px,rgba(89,98,79,.55) 3px,transparent 3px)}
     .gxp-mini{width:100%;border-collapse:collapse}.gxp-mini td,.gxp-mini th{padding:2px 4px;text-align:left}
     .gxp-vt tbody tr{cursor:pointer}
     .gxp-vt-empty{padding:20px;color:#333}
@@ -1591,6 +1619,14 @@
     #gxp-map{position:absolute;left:0;top:0;width:8192px;height:1080px;background:url(${IMG}gxn0.jpg) no-repeat;background-size:100% 100%;transform-origin:0 0}
     .gxp-hidc{padding:0!important;border:0!important;overflow:hidden;font-size:0!important;width:0;max-width:0}.gxp-vt{position:relative}.gxp-vt-colbtn{position:absolute;top:1px;right:2px;z-index:3;cursor:pointer;padding:0 5px;background:#e8e8d8;border:1px solid #bbb;font-weight:bold}.gxp-vt-colmenu{position:absolute;top:20px;right:2px;z-index:30;background:#fff;border:1px solid #888;padding:6px;display:flex;flex-direction:column;gap:2px;max-height:320px;overflow:auto;box-shadow:2px 2px 6px rgba(0,0,0,.3)}.gxp-pbar{display:inline-block;width:100%;height:9px;background:#e4e4d8;border:1px solid #bbb;vertical-align:middle}.gxp-pbar>i{display:block;height:100%;background:#7aa35a}.gxp-toast{position:fixed;right:12px;bottom:28px;z-index:9999;background:#333;color:#fff;padding:6px 10px;border-radius:4px;max-width:360px;font:9pt arial,sans-serif;opacity:.95}#gxp-mapframe.gxp-fs{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;z-index:5000;background:#000}#gxp-fsbtn{position:absolute;top:6px;left:6px;z-index:30;box-sizing:border-box;width:18px;height:18px;padding:0;margin:0;display:flex;align-items:center;justify-content:center;background:#f2f2f2;border:1px solid #000;border-radius:2px;box-shadow:0 0 0 1px #fff,0 1px 4px rgba(0,0,0,.8);cursor:pointer;line-height:0;font-size:0}#gxp-fsbtn::before,#gxp-fsbtn::after{content:none!important}#gxp-fsbtn:focus-visible{outline:2px solid #e0a000}#gxp-fsctl{position:absolute;top:6px;left:44px;z-index:30;display:none;background:#f2f2f2;border:2px solid #000;box-shadow:0 0 0 2px #fff,0 2px 6px rgba(0,0,0,.8);padding:3px;border-radius:3px}#gxp-mapframe.gxp-fs #gxp-fsctl{display:grid;grid-template-columns:repeat(3,26px);gap:2px}#gxp-fsctl span{text-align:center;padding:1px 0}.gxp-subtabs span{display:inline-block;padding:2px 8px;margin-right:2px;border:1px solid #bbb;cursor:pointer;background:#eee}.gxp-subtabs span.on{background:#fff;font-weight:bold}.gxp-chip{display:inline-block;margin:1px 3px;padding:1px 6px;border:1px solid #999;border-radius:9px;cursor:pointer;background:#f6f6ea}.gxp-pick-on{outline:2px solid #e0a000}
     a.gxp-ext,a.gxp-ext:link,a.gxp-ext:visited,a.gxp-ext:hover,a.gxp-ext:active{color:inherit!important;text-decoration:none!important;cursor:pointer;font:inherit;background:none;display:inline!important;padding:0!important;margin:0!important;width:auto!important}#gxp-map img{position:absolute}#gxp-map img.ship,#gxp-map img.globe,#gxp-map img.station{cursor:pointer}#gxp-map img.globe:hover,#gxp-map img.station:hover{outline:2px solid #ffd54a;outline-offset:1px;border-radius:50%}
+    /* 3.0.7: every link in the console is black + underlined (game-provided links, world codes, product links…), incl. any
+     * colour the game puts on inner elements. Country/owner name links (a.gxp-ext) are excluded while #gxp-app carries the
+     * class gxp-extplain (default) — remove that ONE class (EXT_PLAIN in 70-app.js) to give them the same black underline. */
+    #gxp-app a:not(.gxp-ext),#gxp-app a:not(.gxp-ext):link,#gxp-app a:not(.gxp-ext):visited,#gxp-app a:not(.gxp-ext):hover,#gxp-app a:not(.gxp-ext):active{color:#000!important;text-decoration:underline!important}
+    #gxp-app a:not(.gxp-ext) *{color:inherit!important}
+    /* 3.0.7: plain-colour country/owner links are underlined while "Clickable names" + "also in tables" are on (class gxp-extul) */
+    #gxp-app.gxp-extul a.gxp-ext,#gxp-app.gxp-extul a.gxp-ext:link,#gxp-app.gxp-extul a.gxp-ext:visited,#gxp-app.gxp-extul a.gxp-ext:hover,#gxp-app.gxp-extul a.gxp-ext:active{text-decoration:underline!important}
+    #gxp-app:not(.gxp-extplain) a.gxp-ext,#gxp-app:not(.gxp-extplain) a.gxp-ext:link,#gxp-app:not(.gxp-extplain) a.gxp-ext:visited,#gxp-app:not(.gxp-extplain) a.gxp-ext:hover,#gxp-app:not(.gxp-extplain) a.gxp-ext:active{color:#000!important;text-decoration:underline!important}
     #gxp-marker{position:absolute;display:none;pointer-events:none;width:20px;height:32px;z-index:10}
     #gxp-maptools{position:absolute;right:6px;top:6px;z-index:20;display:flex;gap:4px}
     #gxp-foot{flex:0 0 auto;padding:2px 8px;color:#ceceb5;font-size:8pt;border-top:1px solid gold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1659,7 +1695,7 @@
 
     /* ---------- DOM skeleton ---------- */
     const style = doc.createElement('style'); style.textContent = CSS_TEXT; doc.head.appendChild(style);
-    const root = doc.createElement('div'); root.id = 'gxp-app';
+    const root = doc.createElement('div'); root.id = 'gxp-app'; const EXT_PLAIN = true; /* 3.0.7: country/owner name links plain (no underline) while true */ if (EXT_PLAIN) root.classList.add('gxp-extplain');
     const TABS = [['ships', 'Shuttles'], ['stations', 'Stations'], ['centers', 'Space Centers'], ['markets', 'Markets'], ['docks', 'Docking'], ['transport', 'Transport'], ['trends', 'Trends'], ['events', 'Events'], ['debug', 'Debug']];
     root.innerHTML = `
       <div id="gxp-head" class="gxpanel_bar">
@@ -1734,9 +1770,38 @@
     on(shipsTab.bar, 'click', e => { const c = e.target.closest('[data-chip]'); if (!c) return; sf.status = sf.status === c.dataset.chip ? 'all' : c.dataset.chip; shipsTab.bar.querySelector('[data-f=status]').value = sf.status; renderAll(); });
     on(shipsTab.bar, 'change', e => { const f = e.target.dataset.f; if (!f) return; if (f === 'owner' && e.target.value === 'mine') logMine('filter selected'); sf[f] = e.target.type === 'checkbox' ? e.target.checked : e.target.value; renderAll(); });
     /** 0.2.7: the shuttle-list filters, shared by the list and the map. */
+    /* 3.0.1 location normalisation. Root cause of duplicates / centers in the Location dropdown: the shuttle list gives the
+     * PLANET name ("Kebir Blue") while the shuttle info page gives the SPACE CENTER ("Center on KB"); both write s.location,
+     * and the old worldOf() turned one into "KB" and kept the other as "Kebir Blue" (two entries for one planet) and kept any
+     * name without " on XX" (stations, some centers) raw. Now every place maps to one stable key:
+     *   "<center> on XX" -> planet with initials XX (full name when known), known planet name -> that planet,
+     *   known station name -> station, GDS coordinates -> in space; names compared after whitespace/case/NFKC normalisation. */
+    const nk = v => normName(v).toLowerCase();
+    let locCache = { at: 0 };
+    function locIndex() {
+      if (Date.now() - locCache.at < 2000) return locCache;
+      const planets = new Map(), byInit = new Map(), stations = new Set();
+      const addPlanet = n => { const k = nk(n); if (!k || / on [a-z]{2,3}$/.test(k) || /^gds\./.test(k)) return; const disp = String(n).replace(/[\s\u00a0]+/g, ' ').trim(); if (!planets.has(k)) planets.set(k, disp); const i = initials(disp); if (i.length >= 2 && !byInit.has(i)) byInit.set(i, disp); };
+      try { for (const g of (typeof globes !== 'undefined' ? globes : [])) addPlanet(g.name); } catch (e) { /* map not ready */ }
+      for (const st of (data.stations || [])) if (st && st.name) stations.add(nk(st.name));
+      for (const s of tracker.ships.values()) { if (s.listLocation) addPlanet(s.listLocation); }
+      locCache = { at: Date.now(), planets, byInit, stations }; return locCache;
+    }
+    function locKeyOf(loc) {
+      const raw = normName(loc); if (!raw || raw === '-') return null; const k = raw.toLowerCase(), L = locIndex();
+      if (/^gds\./.test(k) || /in space/.test(k)) return { key: 'sp', label: 'in space' };
+      const m = / on ([a-z]{2,3})$/i.exec(raw); if (m) { const code = m[1].toUpperCase(), full = L.byInit.get(code); return { key: 'p:' + code, label: full ? `${full} (${code})` : code }; }
+      if (L.stations.has(k)) return { key: 's:' + k, label: raw + ' (station)' };
+      if (L.planets.has(k)) { const i = initials(L.planets.get(k)); return { key: 'p:' + (i.length >= 2 ? i : k), label: `${L.planets.get(k)}${i.length >= 2 ? ' (' + i + ')' : ''}` }; }
+      return { key: 'o:' + k, label: raw };
+    }
+    const shipLocKeys = s => [s.location, s.destination].map(locKeyOf).filter(Boolean).map(x => x.key);
+    /** Ships that count for the dropdown: same stale/retired visibility as the list (retired/stale only when those filters show them). */
+    const locEligible = s => (sf.stale || !s.stale) && (sf.retired || s.status !== 'retired' || sf.status === 'retired' || sf.status === 'offload');
+    app.locKeyOf = locKeyOf; app.locIndexReset = () => { locCache = { at: 0 }; };
     function filteredShips() { const q = sf.q.trim().toLowerCase();
       return [...tracker.ships.values()].filter(s => (sf.stale || !s.stale) && (sf.retired || s.status !== 'retired' || sf.status === 'retired' || sf.status === 'offload') && textMatch(q, [s.name, s.owner, s.location, s.destination, s.id, aliasOf(s.location), aliasOf(s.destination)])
-        && (sf.owner !== 'mine' || isMine(s)) && (sf.status === 'all' || s.status === sf.status || (sf.status === 'active' && s.status !== 'retired') || (sf.status === 'offload' && s.status === 'retired' && s.cargo > 0)) && (sf.world === 'all' || worldOf(s.location) === sf.world));
+        && (sf.owner !== 'mine' || isMine(s)) && (sf.status === 'all' || s.status === sf.status || (sf.status === 'active' && s.status !== 'retired') || (sf.status === 'offload' && s.status === 'retired' && s.cargo > 0)) && (sf.world === 'all' || shipLocKeys(s).indexOf(sf.world) >= 0));
     }
     /** Shuttles to draw on the map: same set as the list, in reverse list order so the top rows are drawn on top. */
     function mapShips() { const vt = shipsTab.vt; return sortRows(filteredShips(), SHIP_COLS.find(c => c.key === vt.sort.key), vt.sort.dir).filter(s => s.onMap && s.mapObj).reverse(); }
@@ -1752,8 +1817,10 @@
       const vals = [...tracker.ships.values()], ret = vals.filter(s => s.status === 'retired'), off = ret.filter(s => s.cargo > 0).length;
       const idle = vals.filter(s => s.status === 'idle').length, fl = vals.filter(s => s.status === 'flight').length;
       shipsTab.count.innerHTML = `${rows.length} of ${all} shown · <span title="idle, not retired">${idle} idle</span> · ${fl} in flight · <span class="gxp-retired-chip" data-chip="retired" role="button" tabindex="0" title="Show retired (0 missions left)">${ret.length} retired</span>${off ? ` · <span class="gxp-warn" data-chip="offload" role="button" tabindex="0" title="Retired shuttles still holding cargo">${off} need offload</span>` : ''} · ${stale} stale · details ${det}/${all}`;
-      const sel = shipsTab.bar.querySelector('[data-f=world]'); const worlds = [...new Set([...tracker.ships.values()].map(s => worldOf(s.location)).filter(Boolean))].sort();
-      syncOptions(sel, [['all', 'any location']].concat(worlds.map(w => [w, w])), sf.world);
+      const sel = shipsTab.bar.querySelector('[data-f=world]'); const locs = new Map();
+      for (const s of tracker.ships.values()) { if (!locEligible(s)) continue; for (const x of [s.location, s.destination].map(locKeyOf)) if (x && !locs.has(x.key)) locs.set(x.key, x.label); }
+      if (sf.world !== 'all' && !locs.has(sf.world)) sf.world = 'all';
+      syncOptions(sel, [['all', 'any location']].concat([...locs].sort((a, b) => a[1].localeCompare(b[1]))), sf.world);
     }
 
     /* ---------- Stations / Markets / Docking ---------- */
@@ -1922,7 +1989,7 @@
         <h4>Results log</h4><div id="gxp-tr-results"></div>
       </div>`;
     const TP = P('transport'), trSel = { o: null, t: null, p: null }, trf = { o: '', t: '', p: '' };
-    const pickCols = k => k === 'p' ? [{ key: 'name', label: 'Product', w: '62%' }, { key: 'stock', label: 'Stock', w: '38%', num: true, html: r => fmtN(r.stock) }]
+    const pickCols = k => k === 'p' ? [{ key: 'name', label: 'Product', w: '62%', grow: true, html: r => prodCell(r.name, null, r.img) }, { key: 'stock', label: 'Stock', w: '38%', num: true, html: r => fmtN(r.stock) }]
       : [{ key: 'name', label: 'Name', w: '70%', html: r => aliasHtml(r.name), title: r => r.cells.join(' · ') }, { key: 'kind', label: 'Kind', w: '30%', html: r => ({ 2: 'center', 3: 'station', 4: 'dock', 5: 'depot' }[r.kind] || r.kind) }];
     const pickKey = r => r.product ? 'p' + r.product : r.kind + ':' + r.stationId + ':' + r.entityId + ':' + r.target + ':' + r.name;
     const pickers = {};
@@ -1963,7 +2030,7 @@
     for (const el of TP.querySelectorAll('[data-act]')) onBtn(el, () => act(el.dataset.act));
     app.transportAction = act; app.trSel = trSel;
     const ST_LABEL = { draft: 'draft', valid: 'ready', invalid: 'invalid', submitting: 'sending…', 'needs-confirm': 'CONFIRMATION REQUIRED', 'dry-run': 'dry run — not sent', submitted: 'submitted', 'skipped-duplicate': 'skipped (duplicate)', failed: 'FAILED' };
-    function renderTransport() {
+    function renderTransport() { try { fitPrimary(); } catch (e) { /* before init */ }
       if (activeTab !== 'transport') return;
       const gate = writeGate(settings, transport.template);
       const g = $('gxp-gate'); g.textContent = gate.ok ? 'writes: enabled' : 'writes: off'; g.title = gate.why; g.className = 'gxp-badge ' + (gate.ok ? 'ok' : 'bad');
@@ -1977,56 +2044,63 @@
       { const av = trSel.o && trSel.p ? transport.available(trSel.o, trSel.p) : null; if (av != null && q > av) $('gxp-tr-qty').value = av; }
       const est = trSel.p && q ? transport.estimate(trSel.p.name, q) : null;
       $('gxp-tr-est').textContent = est ? (est.flights ? `≈ ${est.flights} shuttle flight(s), ${est.basis}` : 'flights: ' + est.basis) : '';
-      $('gxp-tr-queue').innerHTML = transport.queue.length ? '<table style="width:100%;border-collapse:collapse">' + transport.queue.map((it, i) => { const e = transport.estimate(it.product.name, it.quantity);
+      const qh = transport.queue.length ? '<table style="width:100%;border-collapse:collapse">' + transport.queue.map((it, i) => { const e = transport.estimate(it.product.name, it.quantity);
         return `<tr class="gxpu_rc${i % 2}"><td class="gxpu_data">${fmtN(it.quantity)} ${esc(it.product.name)}</td><td class="gxpu_data">${aliasHtml(it.origin.name)} → ${aliasHtml(it.target.name)}</td>
           <td class="gxpu_data">${e.flights ? '≈' + e.flights + ' flights' : 'flights unknown'}</td><td class="gxpu_data ${it.status === 'failed' || it.status === 'invalid' ? 'gxp-warn' : ''}"><b>${ST_LABEL[it.status] || it.status}</b> ${esc(it.issues.join('; '))} ${esc(it.message || '')}</td>
           <td class="gxpu_data"><span class="gxbutton gxp-btn" data-rm="${it.qid}" role="button" tabindex="0">remove</span> <span class="gxbutton gxp-btn" data-pv="${it.qid}" role="button" tabindex="0" title="Show the exact request">request</span>${it.status === 'needs-confirm' ? ` <span class="gxbutton gxp-btn" data-cf="${it.qid}" role="button" tabindex="0" title="The game asked for a confirmation. Confirm, then press Submit all again.">Confirm</span>` : ''}</td></tr>`; }).join('') + '</table>' : '<p class="gxpu_text">Queue is empty.</p>';
+      /* 3.0.6: the queue was rebuilt via innerHTML on every redraw (~3×/s while shuttle details load), so a click whose
+       * mousedown and mouseup straddled a rebuild was lost. Rebuild only when the markup changed; buttons act on pointerdown. */
+      { const qe = $('gxp-tr-queue'); if (qe._gxpH !== qh) { qe._gxpH = qh; qe.innerHTML = qh; } }
       renderLive(); /* old: */ if (0) $('gxp-tr-live').innerHTML = transport.live.length ? '<table style="width:100%">' + transport.live.map((r, i) => `<tr class="gxpu_rc${i % 2}"><td class="gxpu_data">${esc(r.product)}</td><td class="gxpu_data n">${fmtN(r.quantity)}</td><td class="gxpu_data">${esc(r.origin)} → ${esc(r.target)}</td><td class="gxpu_data">${esc(r.loaded)}</td><td class="gxpu_data">${esc(r.status)}</td></tr>`).join('') + '</table>' : '<p class="gxpu_text">' + (transport.liveAt ? 'No transports running.' : 'Not read yet (Validate reads it).') + '</p>';
       $('gxp-tr-liveat').textContent = transport.liveAt ? 'read ' + fmtTime(transport.liveAt) : '';
       $('gxp-tr-results').innerHTML = transport.results.length ? '<table style="width:100%">' + transport.results.slice(-50).reverse().map((r, i) => `<tr class="gxpu_rc${i % 2}"><td class="gxpu_data">${fmtTime(r.t)}</td><td class="gxpu_data">${esc(r.outcome)}</td><td class="gxpu_data">${fmtN(r.quantity)} ${esc(r.product)} ${esc(r.origin)} → ${esc(r.target)}</td><td class="gxpu_data">${esc(r.message)}</td></tr>`).join('') + '</table>' : '<p class="gxpu_text">No submissions yet.</p>';
     }
+    /* 3.0.2: barOnly was referenced by the Loaded % / Delivered % columns since 0.2.8.0 but never defined, so the
+     * Transport table threw "barOnly is not defined" as soon as the live list had rows and never redrew. */
+    const barOnly = (v, of) => v == null || !of ? '' : `<span class="gxp-pbar"><i style="width:${Math.max(0, Math.min(100, Math.round(v / of * 100)))}%"></i></span>`;
     const pbar = (v, of) => v == null ? '' : `<span class="gxp-bar-pct" title="${fmtN(v)} of ${fmtN(of)}"><i style="width:${of ? Math.min(100, Math.round(v / of * 100)) : 0}%"></i></span>${fmtN(v)}`;
     const cancelSel = new Set();
     const TRL_COLS = [
-      { key: 'sel', label: '✓', w: '4%', sortVal: r => (cancelSel.has(r.id) ? 0 : 1), html: r => r.cancelable && TR_STATUS[r.status].active && r.id ? `<input type="checkbox" data-cx="${esc(r.id)}" ${cancelSel.has(r.id) ? 'checked' : ''} aria-label="select for cancel">` : '' },
-      { key: 'status', label: 'Status', w: '17%', sortVal: r => ['waiting', 'new', 'transit', 'unknown', 'finished', 'aborted'].indexOf(r.status) * 1000 - (r.pct || 0),
+      { key: 'sel', label: '✓', w: '3%', min: 24, max: 30, sortVal: r => (cancelSel.has(r.id) ? 0 : 1), html: r => transport.canTryCancel(r) ? `<input type="checkbox" title="Select for Cancel selected" data-cx="${esc(r.id)}" ${cancelSel.has(r.id) ? 'checked' : ''} aria-label="select for cancel">` : '' },
+      { key: 'status', label: 'Status', w: '13%', min: 90, max: 170, sortVal: r => ['waiting', 'new', 'transit', 'unknown', 'finished', 'aborted'].indexOf(r.status) * 1000 - (r.pct || 0),
         html: r => `<span class="gxp-st" style="color:${TR_STATUS[r.status].color}">${TR_STATUS[r.status].icon} ${esc(r.statusLabel)}</span>`, title: r => ({ waiting: 'Transport still not started: no shuttle available at the origin. Click for diagnosis.', new: 'Transport scheduled, waiting for the next game tick', transit: 'In transport', finished: 'Transport finished', aborted: 'Transport aborted' }[r.status] || '') },
-      { key: 'product', label: 'Product', w: '16%', html: r => r.productId != null ? prodLink(r.product, r.productId) : esc(r.product), title: r => r.product + (r.productId != null ? ' (product ' + r.productId + ')' : '') },
-      { key: 'quantity', label: 'Qty', w: '9%', num: true, html: r => fmtN(r.quantity) },
-      { key: 'route', label: 'Route', w: '22%', sortVal: r => r.origin + '→' + r.target, html: r => `${aliasHtml(r.origin)} → ${aliasHtml(r.target)}`, title: r => r.origin + ' → ' + r.target },
-      { key: 'loaded', label: 'Loaded', w: '8%', num: true, html: r => fmtN(r.loaded) },
-      { key: 'loadedBar', label: 'Loaded %', w: '7%', sortVal: r => r.quantity ? r.loaded / r.quantity : 0, html: r => barOnly(r.loaded, r.quantity), title: r => r.quantity ? Math.round(100 * (r.loaded || 0) / r.quantity) + '% loaded' : '' },
-      { key: 'delivered', label: 'Delivered', w: '8%', num: true, html: r => fmtN(r.delivered) },
-      { key: 'deliveredBar', label: 'Delivered %', w: '7%', sortVal: r => r.quantity ? r.delivered / r.quantity : 0, html: r => barOnly(r.delivered, r.quantity), title: r => r.quantity ? Math.round(100 * (r.delivered || 0) / r.quantity) + '% delivered' : '' },
-      { key: 'cancelable', label: 'Cancel', w: '8%', html: r => r.cancelable && TR_STATUS[r.status].active ? '<span title="Has the game\'s red X: can be cancelled">yes</span>' : '<span class="gxp-approx">—</span>' } ];
+      { key: 'product', label: 'Product', w: '20%', grow: true, html: r => prodCell(r.product, r.productId, r.productIcon), title: r => r.product + (r.productId != null ? ' (product ' + r.productId + ')' : '') },
+      { key: 'quantity', label: 'Qty', w: '7%', num: true, max: 90, html: r => fmtN(r.quantity) },
+      { key: 'route', label: 'Route', w: '27%', grow: true, sortVal: r => r.origin + '→' + r.target, html: r => `${aliasHtml(r.origin)} → ${aliasHtml(r.target)}`, title: r => r.origin + ' → ' + r.target },
+      { key: 'loaded', label: 'Loaded', w: '6%', num: true, max: 80, html: r => fmtN(r.loaded) },
+      { key: 'loadedBar', label: 'Loaded %', w: '5%', min: 40, max: 70, sortVal: r => r.quantity ? r.loaded / r.quantity : 0, html: r => barOnly(r.loaded, r.quantity), title: r => r.quantity ? Math.round(100 * (r.loaded || 0) / r.quantity) + '% loaded' : '' },
+      { key: 'delivered', label: 'Delivered', w: '6%', num: true, max: 80, html: r => fmtN(r.delivered) },
+      { key: 'deliveredBar', label: 'Delivered %', w: '5%', min: 40, max: 70, sortVal: r => r.quantity ? r.delivered / r.quantity : 0, html: r => barOnly(r.delivered, r.quantity), title: r => r.quantity ? Math.round(100 * (r.delivered || 0) / r.quantity) + '% delivered' : '' },
+      { key: 'cancelable', label: 'Cancel', w: '8%', min: 56, max: 80, sortVal: r => transport.canTryCancel(r) ? (r.cancelable ? 0 : 1) : 2,
+        html: r => transport.canTryCancel(r) ? `<span class="gxbutton gxp-btn gxp-cx1" data-cx1="${esc(r.id)}" role="button" tabindex="0" title="${r.cancelable ? 'Cancel this transport (asks for confirmation)' : 'Already underway (no red X in the game): the request is sent once and the game\'s reply shown'}">Cancel${r.cancelable ? '' : '*'}</span>` : '<span class="gxp-approx">—</span>' } ];
     const trl = VTable(doc, $('gxp-trl-host'), TRL_COLS, { id: 'trlist', sort: { key: 'status', dir: 1 }, rowKey: r => r.id || routeKey(r.product, r.origin, r.target), onSort: () => renderTransport(),
-      emptyHtml: () => transport.liveAt ? 'No transport matches.' : 'Not read yet.', rowClass: r => TR_STATUS[r.status].active ? '' : 'stale', onRowClick: (k, e) => { if (e && e.target && e.target.matches && e.target.matches('input[data-cx]')) { const id = e.target.dataset.cx; if (e.target.checked) cancelSel.add(id); else cancelSel.delete(id); renderTransport(); return; }
+      emptyHtml: () => transport.liveAt ? 'No transport matches.' : 'Not read yet.', rowClass: r => TR_STATUS[r.status].active ? '' : 'stale', onRowClick: (k, e) => { const b1 = e && e.target && e.target.closest && e.target.closest('[data-cx1]'); if (b1) { openCancelDialog([b1.dataset.cx1]); return; } if (e && e.target && e.target.matches && e.target.matches('input[data-cx]')) { const id = e.target.dataset.cx; if (e.target.checked) cancelSel.add(id); else cancelSel.delete(id); renderTransport(); return; }
         showTransport(transport.live.find(r => (r.id || routeKey(r.product, r.origin, r.target)) === k)); } });
-    function openCancelDialog() {
-      const items = transport.live.filter(r => cancelSel.has(r.id));
+    /* 3.0.4: cancel uses the normal confirmation dialog ALWAYS (also when "Execute now" is on); one-by-one, stops at the
+     * first failure, list re-read after each to verify; dry run respected (client.writeUrl). */
+    async function openCancelDialog(only) {
+      const ids = only || [...cancelSel], items = transport.live.filter(r => ids.indexOf(r.id) >= 0 && transport.canTryCancel(r));
       if (!items.length) return trMsg('Select transports to cancel first (checkboxes in the list).', true);
-      const old = $('gxp-cancel-dlg'); if (old) old.remove();
-      const g = transport.cancelGate(), d = doc.createElement('div'); d.id = 'gxp-cancel-dlg'; d.className = 'gxp-dialog'; d.setAttribute('role', 'dialog'); d.setAttribute('aria-label', 'Cancel transports');
-      d.innerHTML = `<b>Cancel ${items.length} transport request(s)?</b><table class="gxp-mini">` + items.map((r, i) => `<tr class="gxpu_rc${i % 2}"><td>${esc(r.statusLabel)}</td><td>${fmtN(r.quantity)} ${esc(r.product)}</td><td>${esc(r.origin)} → ${esc(r.target)}</td><td>loaded ${fmtN(r.loaded)} / delivered ${fmtN(r.delivered)}</td><td data-res="${esc(r.id)}"></td></tr>`).join('') + `</table>
-        <p class="gxp-approx">Sent one at a time like the game's red X + "Abort this Transport?" confirmation. The list is re-read before each; rows that are gone or no longer cancellable are skipped. Nothing is retried. Stop on first error: ${settings.stopOnError ? 'on' : 'off'}.</p>
-        ${g.ok ? '' : `<p class="gxp-warn">${esc(g.why)}</p>`}
-        <label><input type="checkbox" id="gxp-cx-ok"> I want to cancel these ${items.length} transports</label>
-        <span class="gxbutton gxp-btn" id="gxp-cx-go" role="button" tabindex="0">Cancel transports</span> <span class="gxbutton gxp-btn" id="gxp-cx-close" role="button" tabindex="0">Close</span> <span id="gxp-cx-msg"></span>`;
-      root.appendChild(d);
-      onBtn(d.querySelector('#gxp-cx-close'), () => d.remove());
-      onBtn(d.querySelector('#gxp-cx-go'), async () => {
-        const m = d.querySelector('#gxp-cx-msg');
-        if (!d.querySelector('#gxp-cx-ok').checked) { m.textContent = 'Tick the confirmation box first.'; m.className = 'gxp-warn'; return; }
-        if (transport.running) return;
-        try { m.textContent = 'cancelling…'; m.className = '';
-          const res = await transport.cancelSelected(items.map(r => r.id), r => { const c = d.querySelector(`[data-res="${CSS.escape ? CSS.escape(r.id) : r.id}"]`); if (c) { c.textContent = r.outcome + (r.message ? ': ' + r.message : ''); c.className = r.outcome === 'cancelled' ? 'gxp-ok' : 'gxp-warn'; } });
-          for (const r of res) if (r.outcome === 'cancelled' || r.outcome === 'skipped-gone') cancelSel.delete(r.id);
-          m.textContent = `done: ${res.filter(r => r.outcome === 'cancelled').length} cancelled, ${res.filter(r => /^skipped/.test(r.outcome)).length} skipped, ${res.filter(r => r.outcome === 'failed').length} failed`; m.className = '';
-        } catch (e) { m.textContent = e.message; m.className = 'gxp-warn'; }
-        renderTransport();
-      });
+      const g = transport.cancelGate(); if (!g.ok) return trMsg(g.why, true);
+      if (transport.running) return trMsg('Busy: another send is running.', true);
+      const under = items.filter(r => !r.cancelable).length;
+      const ok = await confirmWrite({ title: items.length > 1 ? `Cancel ${items.length} transports` : 'Cancel transport', okLabel: items.length > 1 ? `Cancel ${items.length}` : 'Cancel transport',
+        lead: `Cancel ${items.length} transport request(s), one by one, stopping at the first problem:`,
+        items: { head: ['Status', 'Product', 'Qty', 'Route', 'Loaded / delivered'], rows: items.map(r => [r.statusLabel + (r.cancelable ? '' : ' (underway)'), r.product, fmtN(r.quantity), r.origin + ' → ' + r.target, fmtN(r.loaded) + ' / ' + fmtN(r.delivered)]) },
+        notes: ['Same as the game\'s red X + "Abort this Transport?". The list is re-read before and after each to verify. Nothing is retried.'].concat(under ? [`${under} already underway (no red X in the game): the request is sent once and the game's reply is shown as-is.`] : []),
+        debug: items.map(r => ({ method: 'GET /cgi-bin/cgip?gxDelTransportRequest&miKey=' + r.id, note: 'step 1; step 2 = the game\'s confirm form, if it shows one' })) });
+      if (!ok) return trMsg('Cancel not sent.');
+      trMsg('cancelling…');
+      try {
+        const res = await transport.cancelSelected(items.map(r => r.id));
+        for (const r of res) if (r.outcome === 'cancelled' || r.outcome === 'skipped-gone') cancelSel.delete(r.id);
+        const bad = res.find(r => r.outcome === 'failed'), dry = res.filter(r => r.outcome === 'dry-run');
+        trMsg(dry.length ? `dry run — not sent: ${dry.map(r => r.message).join(' | ')}` : `cancel: ${res.filter(r => r.outcome === 'cancelled').length} cancelled, ${res.filter(r => /^skipped/.test(r.outcome)).length} skipped, ${res.filter(r => r.outcome === 'failed').length} failed${bad ? ' — stopped. Game reply: ' + bad.message : ''}`, !!bad);
+        app.lastCancel = res;
+      } catch (e) { trMsg(e.message, true); }
+      renderTransport();
     }
-    app.openCancelDialog = openCancelDialog; app.cancelSel = cancelSel;
+    app.openCancelDialog = openCancelDialog; app.cancelSel = cancelSel; app.trlVT = trl;
     app.cleanups.push(() => trl.destroy());
     const trlf = { st: 'all', q: '' };
     on($('gxp-trl-st'), 'change', e => { trlf.st = e.target.value; renderTransport(); }); on($('gxp-trl-q'), 'input', e => { trlf.q = e.target.value.toLowerCase(); renderTransport(); });
@@ -2049,7 +2123,7 @@
         (diag ? `<div class="gxp-dialog" style="position:static;box-shadow:none;max-width:none"><b>Why is it waiting?</b><br>${esc(diag.hint)}<br>
           Idle at origin: ${diag.idle.length ? shipList(diag.idle) : 'none'}<br>On the way to origin: ${diag.enroute.length ? shipList(diag.enroute) : 'none'}<br>Retired at origin: ${diag.retired}
           <br><span class="gxp-approx">Based on ${diag.known} shuttles of yours that Galaxy Console has seen.</span></div>` : '') +
-        (r.cancelable ? '<p class="gxp-approx">Cancel: not supported in Galaxy Console (write). Use the red X in the game\'s transport list.</p>' : '');
+        (transport.canTryCancel(r) ? '<p class="gxp-approx">Cancel: use the Cancel button in the list row (asks for confirmation).</p>' : '');
       box.innerHTML = head + (r.id ? '<p><span class="gxp-skel"></span> loading transport info…</p>' : '');
       if (!r.id) return;
       try { const inf = await transport.loadInfo(r.id); if (inf.expired) throw new Error('not signed in'); learnOwner(inf.info.Owner, 'your transport info', inf.info._ownerKey);
@@ -2065,13 +2139,15 @@
     session.subscribe(state => { if (state === 'ok' && !owner.names.size && !app._ownerListRead) { app._ownerListRead = true; dbg.script('info', 'owner unknown: reading your transport list once to learn it');
       transport.readLive().then(() => { if (!transport.live.some(r => r.id)) dbg.script('info', 'owner probe: no transports in your list; set your name in Settings if "mine" stays empty'); }).catch(e => { app._ownerListRead = false; dbg.script('debug', 'owner probe list failed: ' + e.message); }); } });
     every(() => { if (activeTab === 'transport' && session.state === 'ok' && !transport.running && Date.now() - transport.liveAt > 60000) transport.readLive().catch(() => {}); }, 15000);
-    on(TP, 'click', async e => { const rm = e.target.closest('[data-rm]'), pv = e.target.closest('[data-pv]'), cf = e.target.closest('[data-cf]');
-      if (cf) { await transport.confirmItem(cf.dataset.cf); renderTransport(); }
-      if (rm) { await transport.remove(rm.dataset.rm); renderTransport(); }
+    const queueAct = async (rm, cf) => { if (cf) { await transport.confirmItem(cf.dataset.cf); renderTransport(); } if (rm) { const p = transport.remove(rm.dataset.rm); renderTransport(); await p; } };
+    on(TP, 'pointerdown', e => { if (e.button) return; const rm = e.target.closest('[data-rm]'), cf = e.target.closest('[data-cf]'); if (!rm && !cf) return; e.preventDefault(); queueAct(rm, cf); });
+    on(TP, 'keydown', e => { if (e.key !== 'Enter' && e.key !== ' ') return; const rm = e.target.closest('[data-rm]'), cf = e.target.closest('[data-cf]'); if (!rm && !cf) return; e.preventDefault(); queueAct(rm, cf); });
+    on(TP, 'click', async e => { const pv = e.target.closest('[data-pv]');
+      if (!e.detail) { const rm = e.target.closest('[data-rm]'), cf = e.target.closest('[data-cf]'); if (rm || cf) await queueAct(rm, cf); } // keyboard activation (Enter/Space) only; mouse handled on pointerdown
       if (pv) { const it = transport.queue.find(i => i.qid === pv.dataset.pv); let u; try { u = transport.preview(it); } catch (x) { u = x.message; }
         $('gxp-details').innerHTML = `<h3>Request that "Submit all" would send</h3><p class="gxpu_text">XHR <b>POST</b> (empty body), like the original gxSendTransportForm → gxObjectFrame:</p><pre style="white-space:pre-wrap;word-break:break-all">${esc(u)}</pre><p class="gxpu_text">${esc(writeGate(settings, transport.template).why)}</p>`; } });
     transport.subscribe(() => renderTransport());
-    tabOpeners.transport = () => { if (!transport.origins.length && session.state !== 'expired') act('pick'); };
+    tabOpeners.transport = () => { if (!transport.origins.length && session.state !== 'expired') act('pick'); /* 3.0.2: Refresh on this tab re-reads the live transport list */ if (session.state !== 'expired' && !transport.running) transport.readLive().then(() => renderTransport()).catch(e => dbg.script('debug', 'transport list refresh: ' + e.message)); };
 
     /* ---------- Events ---------- */
     const EV_COLS = [{ key: 't', label: 'Time', w: '15%', num: true, min: 110, max: 130, html: e => fmtTime(e.t) }, { key: 'name', label: 'Shuttle', w: '15%', grow: true, min: 110, title: e => 'ID ' + e.ship }, { key: 'owner', label: 'Owner', w: '13%', html: e => ownerLinkT(e.owner) },
@@ -2104,13 +2180,14 @@
       <select data-f="level" title="Minimum debug level to show"><option value="debug">debug+</option><option value="info">info+</option><option value="warn">warn+</option><option value="error">error</option></select>
       <span class="gxbutton gxp-btn" data-act="exp" role="button" tabindex="0">Export text</span>
       <span class="gxbutton gxp-btn" data-act="copyAll" role="button" tabindex="0" title="Copy the whole debug log (all channels and levels) to the clipboard">Copy all</span>
-      <span class="gxbutton gxp-btn" data-act="copy200" role="button" tabindex="0" title="Copy the newest 200 lines (all channels and levels)">Copy last 200</span>`, DB_COLS, { sort: { key: 'n', dir: -1 }, rowKey: e => String(e.n) });
+      <span class="gxbutton gxp-btn" data-act="copy500" role="button" tabindex="0" title="Copy the newest 500 lines (all channels and levels) to the clipboard">Copy last 500</span> <span class="gxbutton gxp-btn" data-act="exp500" role="button" tabindex="0" title="Download the newest 500 lines (all channels and levels) as a .txt file">Export last 500</span>`, DB_COLS, { sort: { key: 'n', dir: -1 }, rowKey: e => String(e.n) });
     const dbf = { channel: 'all', level: settings.debugLevel || 'info' }; dbTab.bar.querySelector('[data-f=level]').value = dbf.level;
     on(dbTab.bar, 'change', e => { const f = e.target.dataset.f; if (f) { dbf[f] = e.target.value; if (f === 'level') { settings.debugLevel = dbf.level; saveSettings(); } renderAll(); } });
     onBtn(dbTab.bar.querySelector('[data-act=exp]'), () => downloadText(doc, 'galaxyplus-debug.txt', dbg.toText(dbf.channel, dbf.level)));
     const copyLog = async n => { const all = dbg.toText('all', 'debug').split('\n'); const lines = n ? all.slice(-n) : all; const text = lines.join('\n');
       const how = await copyText(doc, text); dbTab.count.textContent = how ? `copied ${lines.length} lines (${how})` : 'copy failed: use Export text'; dbg.script(how ? 'info' : 'warn', `debug log copy: ${lines.length} lines via ${how || 'nothing'}`); };
-    onBtn(dbTab.bar.querySelector('[data-act=copyAll]'), () => copyLog(0)); onBtn(dbTab.bar.querySelector('[data-act=copy200]'), () => copyLog(200));
+    onBtn(dbTab.bar.querySelector('[data-act=copyAll]'), () => copyLog(0)); onBtn(dbTab.bar.querySelector('[data-act=copy500]'), () => copyLog(500));
+    onBtn(dbTab.bar.querySelector('[data-act=exp500]'), () => { const lines = dbg.toText('all', 'debug').split('\n').slice(-500); downloadText(doc, `galaxy-console-debug-last500-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`, lines.join('\n'), 'text/plain'); dbg.script('info', `debug log export: last ${lines.length} lines`); }); // 3.0.6
     let dbgDirty = false; app.cleanups.push(dbg.subscribe(() => { dbgDirty = true; }));
     function renderDebug() { const r = sortRows(dbg.entries(dbf.channel, dbf.level), DB_COLS.find(c => c.key === dbTab.vt.sort.key), dbTab.vt.sort.dir); dbTab.vt.setRows(r); if (!/^cop/.test(dbTab.count.textContent) || Date.now() - (dbTab._ct || 0) > 4000) { dbTab.count.textContent = `${r.length} of ${dbg.size()} entries (ring of ${LIMITS.DEBUG_RING})`; } }
     every(() => { if (dbgDirty && activeTab === 'debug') { dbgDirty = false; renderDebug(); } }, 1000);
@@ -2171,14 +2248,46 @@
     }
     app.select = select; app.centerOn = centerOn;
 
+    /* 3.0.7: underline country/owner name links while clickable names + 'also in tables' are on (live) */
+    function applyExtUl() { root.classList.toggle('gxp-extul', settings.linkNames !== false && settings.linkNamesTables !== false); }
+    applyExtUl(); app.applyExtUl = applyExtUl;
     /* ---------- splitters ---------- */
-    function splitter(bar, target, axis) {
+    /** Pane splitter. 3.0.3: optional o = { min, max, set(px) } so the same drag code also sizes stacked lists (height). */
+    function splitter(bar, target, axis, o) {
       on(bar, 'pointerdown', e => { e.preventDefault(); const start = axis === 'x' ? e.clientX : e.clientY, r = target.getBoundingClientRect(), size = axis === 'x' ? r.width : r.height;
-        const total = axis === 'x' ? $('gxp-main').clientWidth : $('gxp-side').clientHeight;
-        const mv = ev => { target.style.flexBasis = Math.max(120, Math.min(total - 160, size + (axis === 'x' ? ev.clientX : ev.clientY) - start)) + 'px'; };
-        const up = () => { W.removeEventListener('pointermove', mv); W.removeEventListener('pointerup', up); };
-        W.addEventListener('pointermove', mv); W.addEventListener('pointerup', up); });
+        const total = o ? 0 : axis === 'x' ? $('gxp-main').clientWidth : $('gxp-side').clientHeight;
+        const lo = o ? o.min : 120, hi = o ? Math.max(o.min, typeof o.max === 'function' ? o.max() : o.max) : total - 160;
+        const mv = ev => { const px = Math.max(lo, Math.min(hi, size + (axis === 'x' ? ev.clientX : ev.clientY) - start)); if (o) o.set(px); else target.style.flexBasis = px + 'px'; };
+        const up = () => { W.removeEventListener('pointermove', mv); W.removeEventListener('pointerup', up); bar.classList.remove('on'); };
+        bar.classList.add('on'); W.addEventListener('pointermove', mv); W.addEventListener('pointerup', up); });
     }
+    /* 3.0.3: height handles for stacked lists. The handle is an absolutely positioned thin line laid ON the existing gap
+     * below the list (bottom:-5px), so it adds no layout height. Double-click resets to the stylesheet default. */
+    const listHeights = {};
+    function heightHandle(el, key, min, max) {
+      el.classList.add('gxp-hh-host'); const h = doc.createElement('div'); h.className = 'gxp-hh'; h.dataset.hh = key;
+      h.setAttribute('role', 'separator'); h.setAttribute('aria-orientation', 'horizontal'); h.title = 'Drag to change the list height (double-click: default)';
+      el.appendChild(h);
+      const set = px => { if (px == null) { el.style.height = ''; el.style.flexBasis = ''; delete listHeights[key]; if (typeof fitPrimary === 'function') fitPrimary(); } else { el.style.height = px + 'px'; el.style.flexBasis = px + 'px'; listHeights[key] = px; } };
+      splitter(h, el, 'y', { min, max, set }); on(h, 'dblclick', () => set(null));
+      heightHandle.set = heightHandle.set || {}; heightHandle.set[key] = set;
+    }
+    /* 3.0.3: dragged heights are capped to the visible tab height so each list keeps its own scrollbars instead of the tab scrolling */
+    const tabRoom = () => { const b = TP.querySelector('.gxp-scrollbox'); return b && b.clientHeight ? b.clientHeight - 40 : 900; };
+    heightHandle(TP.querySelector('.gxp-tr-grid'), 'trPick', 120, tabRoom); heightHandle($('gxp-trl-host'), 'trList', 100, tabRoom); // 3.0.3
+    /* 3.0.3: primary list fill. Single-list tabs already flex-fill (.gxp-vt flex:1). On the stacked Transport tab the
+     * live transport list is the primary list: it grows to the bottom of the visible tab (min = stylesheet 260px) and is
+     * recomputed on window resize / tab show / redraw; other panes keep their dragged heights. A dragged trList height wins
+     * until double-click reset. */
+    function fitPrimary() {
+      const host = $('gxp-trl-host'), box = host && host.closest('.gxp-scrollbox'); if (!host || !box || listHeights.trList || !box.clientHeight) return;
+      const top = host.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
+      const want = Math.max(260, Math.floor(box.clientHeight - top - 8));
+      if (Math.abs((parseFloat(host.style.height) || 0) - want) > 1) { host.style.height = want + 'px'; host.dataset.fill = '1'; }
+    }
+    W.addEventListener('resize', () => fitPrimary()); app.fitPrimary = fitPrimary;
+    app.listHeights = () => Object.assign({}, listHeights);
+    app.setListHeights = o => { for (const [k, v] of Object.entries(o || {})) if (heightHandle.set && heightHandle.set[k] && v > 0) heightHandle.set[k](v); };
     splitter($('gxp-sv'), $('gxp-left'), 'x'); splitter($('gxp-sh'), $('gxp-details'), 'y');
 
     /* ---------- settings dialog ---------- */
@@ -2217,16 +2326,17 @@
       on(d, 'change', e => { const k = e.target.dataset.s; if (!k) return; settings[k] = e.target.type === 'checkbox' ? e.target.checked : (e.target.type === 'number' ? (k === 'tuSeconds' ? Math.max(0.1, +e.target.value || DEFAULT_SETTINGS.tuSeconds) : Math.max(0, +e.target.value || 0)) : e.target.value.trim());
         saveSettings(); foot(); if (k === 'linkNames') { const sub2 = d.querySelector('[data-s=linkNamesTables]'); if (sub2) sub2.disabled = !settings.linkNames; }
         if (k === 'linkNames' || k === 'linkNamesTables') { LK.at = 0; renderAll(); if (typeof forceDetails === 'function') forceDetails(); }
-        if (k === 'devTools' || k === 'formCapture') applyDevTools(); if (k.indexOf('notify') === 0) notifySettingChanged(k); dbg.script('info', 'setting ' + k + ' = ' + settings[k]); if (k === 'meOverride' || k === 'meExtra') logMine('settings changed'); renderAll(); });
+        if (k === 'devTools' || k === 'formCapture') applyDevTools(); if (k === 'linkNames' || k === 'linkNamesTables') applyExtUl(); if (k.indexOf('notify') === 0) notifySettingChanged(k); dbg.script('info', 'setting ' + k + ' = ' + settings[k]); if (k === 'meOverride' || k === 'meExtra') logMine('settings changed'); renderAll(); });
       onBtn(d.querySelector('[data-close]'), () => d.remove()); settingsDialogExtras(d);
       onBtn(d.querySelector('[data-act=forgetOwner]'), () => { owner.names.clear(); owner.keys.clear(); try { W.localStorage.removeItem('gxp.owner'); } catch (e) { /* */ } app._ownerProbe = app._ownerListRead = false; dbg.script('info', 'detected owner forgotten'); d.remove(); renderAll(); });
     });
 
     /* ---------- status ---------- */
+    const median = a => { const b = a.slice().sort((x, y) => x - y), m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
     const pollInfo = { status: 'starting', at: 0, errors: 0, cadence: [] };
     function renderStatus() {
       const c = client.stats, ago = pollInfo.at ? Math.round((Date.now() - pollInfo.at) / 1000) + 's ago' : 'never';
-      const cad = pollInfo.cadence.length ? Math.round(pollInfo.cadence.reduce((a, b) => a + b, 0) / pollInfo.cadence.length / 1000) + 's' : '-';
+      const cad = pollInfo.cadence.length >= 3 ? Math.round(median(pollInfo.cadence) / 1000) + 's' : '-'; // 3.0.2: median of in-cadence samples (was a mean incl. outliers)
       const active = [...tracker.ships.values()].filter(s => s.status === 'flight' || isActive(s)).length;
       $('gxp-status').textContent = `map: ${pollInfo.status} (${ago})${pollInfo.errors ? ', ' + pollInfo.errors + ' errors' : ''} · ${active} active shuttles, refresh every ≈${cad} · requests ${client.pending} pending, ${c.done} ok, ${c.failed} failed, ${c.retried} retried`;
       const b = $('gxp-session'); b.textContent = 'session: ' + ({ ok: 'signed in', expired: 'not signed in', unknown: 'checking…' }[session.state] || session.state);
@@ -2252,6 +2362,10 @@
     const TTL = { cargo: 60000, logs: 120000, station: 120000, free: 300000, product: 3600000, world: 3600000 };
     const sortBtn = (tbl, key, label) => { const s = X25.sort[tbl] || {}; return `<th class="gxp-sortable" data-gxp-sort="${tbl}:${key}" style="cursor:pointer" title="Sort">${esc(label)}${s.key === key ? (s.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`; };
     const sorted = (tbl, rows, def) => { const s = X25.sort[tbl] || def || {}; if (!s.key) return rows; return rows.slice().sort((a, b) => { const x = a[s.key], y = b[s.key]; return (typeof x === 'number' || typeof y === 'number' ? (x || 0) - (y || 0) : String(x || '').localeCompare(String(y || ''))) * (s.dir || 1); }); };
+    /* 3.0.5: product name on the Transport tab: bold black (category link colours were unreadable), with the game's
+     * category/product icon left of it when the page provides one (only https images.simcountry.com, or a bare game file name). */
+    const iconUrl = u => { u = String(u || '').trim(); if (!u) return ''; if (/^https:\/\/images\.simcountry\.com\/[\w./-]+\.(gif|png|jpe?g|webp)$/i.test(u)) return u; if (/^[\w-]+\.(gif|png)$/i.test(u)) return 'https://images.simcountry.com/' + u; return ''; };
+    const prodCell = (name, id, icon) => { const i = iconUrl(icon); return `<span class="gxp-pn">${i ? `<img class="gxp-pi" src="${esc(i)}" alt="" loading="lazy" onerror="this.remove()">` : ''}${prodLink(name, id)}</span>`; };
     const prodLink = (name, id) => id ? `<a href="#" data-gxp-prod="${esc(id)}" data-gxp-pname="${esc(name)}" title="Product info and market history">${esc(name)}</a>` : esc(name);
     function worldLinks(place) { const code = worldCode(place); if (aliasOf(place)) return aliasHtml(place); if (!code) return esc(place); const g = globes.find(x => initials(x.name) === code);
       return g ? esc(String(place).slice(0, -code.length)) + `<a href="#" data-gxp-world="${esc(g.id)}" title="${esc(g.name)}: world info">${esc(code)}</a>` : esc(place); }
@@ -2480,6 +2594,15 @@
 
     /* ---------- capture: scan pages (reads only) ---------- */
     const capState = new Map(); // key 'ship:<id>' | 'station:<id>' -> { running, actions:[], error }
+    /* 3.0.5: every write exchange (request URL, reply, any confirm form in the reply; also blocked / dry-run / failed
+     * attempts) is captured automatically while Developer tools + Form capture are on. Before, capture only grew from the
+     * manual "Capture … forms" buttons, so writes were never recorded. */
+    client.onWrite = x => {
+      if (!settings.devTools || !settings.formCapture) return;
+      const cf = x.response ? captureForms(x.response) : { forms: [], submits: [], message: '' };
+      capAdd({ kind: 'write', method: x.method, note: x.note || '', url: x.url || '', status: x.status == null ? null : x.status, ms: x.ms, outcome: x.blocked ? 'blocked: ' + x.blocked : x.dryRun ? 'dry run' : x.error ? 'error: ' + x.error : 'sent',
+        response: x.response ? String(x.response).slice(0, 60000) : '', forms: cf.forms, submits: cf.submits, message: cf.message, row: x.row || null });
+    };
     async function capRead(kind, key, method, params) {
       const html = await cachedRead('cap:' + key, method, params, 15000), sc = scanActions(html), cf = captureForms(html);
       capAdd({ kind: 'page', source: kind, method, params, actions: sc, forms: cf.forms, submits: cf.submits, message: cf.message });
@@ -3073,11 +3196,12 @@
     /* ---------- remember window layout (pane sizes, active tab, scroll positions, map view) ---------- */
     const LAY_KEY = 'gxp.layout';
     function layoutNow() { const sc2 = {}; for (const [k] of TABS) { const s = P(k).querySelector('.gxp-vt-s'); if (s) sc2[k] = s.scrollTop; }
-      return { left: $('gxp-left').style.flexBasis || '', details: $('gxp-details').style.flexBasis || '', tab: activeTab, scroll: sc2, map: mapFs.on && mapFs.saved ? mapFs.saved : { sl: mwrap.scrollLeft, st: mwrap.scrollTop, scale: app.getScale() } }; }
+      return { left: $('gxp-left').style.flexBasis || '', details: $('gxp-details').style.flexBasis || '', tab: activeTab, scroll: sc2, lists: app.listHeights ? app.listHeights() : {}, map: mapFs.on && mapFs.saved ? mapFs.saved : { sl: mwrap.scrollLeft, st: mwrap.scrollTop, scale: app.getScale() } }; }
     let layLast = ''; const layStart = nowMs(), layHold = () => nowMs() - layStart < (opts.layoutHoldMs != null ? opts.layoutHoldMs : 10000); // do not save during start-up (restore pending)
     every(() => { if (!settings.layoutMemory || layHold()) return; const s = JSON.stringify(layoutNow()); if (s !== layLast) { layLast = s; lsSet(LAY_KEY, JSON.parse(s)); } }, opts.layoutTickMs || 5000);
     function restoreLayout() { const L = lsGet(LAY_KEY, null); if (!L || !settings.layoutMemory) return false;
       if (L.left) $('gxp-left').style.flexBasis = L.left; if (L.details) $('gxp-details').style.flexBasis = L.details;
+      if (L.lists && app.setListHeights) app.setListHeights(L.lists); // 3.0.3 list heights
       if (L.tab && $('gxp-tab-' + L.tab) && $('gxp-tab-' + L.tab).style.display !== 'none') showTab(L.tab);
       setTimeout(() => { for (const [k, v] of Object.entries(L.scroll || {})) { const s = P(k) && P(k).querySelector('.gxp-vt-s'); if (s) s.scrollTop = v; }
         if (L.map) { if (L.map.scale) app.setScale(L.map.scale); mwrap.scrollLeft = L.map.sl || 0; mwrap.scrollTop = L.map.st || 0; } }, opts.layoutRestoreDelayMs != null ? opts.layoutRestoreDelayMs : 800);
@@ -3165,7 +3289,8 @@
         const prevAt = s.detailAt;
         client.request('gxShipInfo', { miShipID: s.id }, { channel: 'ship:' + s.id, priority: s.id === selected ? 2 : 8 }).promise
           .then(html => { const d = parseShipInfo(html); if (!d) throw new Error('unrecognised shuttle page'); tracker.observe(s.id, { detail: d }, 'detail');
-            if (prevAt && isActive(s)) { pollInfo.cadence.push(Date.now() - prevAt); if (pollInfo.cadence.length > 50) pollInfo.cadence.shift(); }
+            const gap = Date.now() - prevAt; /* 3.0.2: only gaps that reflect the schedule (not first reads after a pause / deprioritised backlog) */
+            if (prevAt && isActive(s) && gap <= 3 * intervalFor(s)) { pollInfo.cadence.push(gap); if (pollInfo.cadence.length > 50) pollInfo.cadence.shift(); }
             s.nextDueAt = Date.now() + intervalFor(s); })
           .catch(e => { if (e.name === 'StaleResponseError') return; s.detailError = e.message; s.nextDueAt = Date.now() + C.DETAIL_ERROR_RETRY_MS; dbg.script('debug', `detail ${s.id}: ${e.message}`); })
           .finally(() => { s._hyd = false; inFlight--; renderAll(); pumpT = later(pumpDetails, C.DETAIL_GAP_MS); });
