@@ -11,8 +11,9 @@ This repo is a small toolkit for people who already play. It does not replace th
 | Script | Version | What it does |
 | --- | --- | --- |
 | [Loan Offers.js](scripts/Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
-| [Order Strategies](scripts/Order%20Strategies) | 1.4.0 | Select, filter, preset, and snapshot stock-order strategies |
-| [Salary Tweaks](scripts/Salary%20Tweaks) | 1.1.0 | Select, filter, and bulk-set state corporation salaries |
+| [Corporation Toolbox.js](scripts/Corporation%20Toolbox.js) | 2.4.1 | Unified sort/filter/select/apply for corporation lists and strategy forms |
+| [Trading Toolbox.js](scripts/Trading%20Toolbox.js) | 1.2.5 | Sort, filter, select, and bulk-edit country and enterprise trading pages |
+| [Profession Toolbox.js](scripts/Profession%20Toolbox.js) | 1.5.0 | Prefill profession changes and merge employment tabs |
 | [Portal.js](scripts/Portal.js) | 1.3.0 | Reorder countries/enterprises and flick the news ticker |
 | [Simcountry Cash Log — endless, sort, filter](scripts/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter) | 1.6.0 | Sort, filter, cap, and export Cash Log plus sales and purchase logs |
 | [War Casualty Bookmarklet](3rd%20Party/War%20Casualty%20Bookmarklet.txt) | 3rd party | Summarize war losses from a battle report page |
@@ -23,16 +24,30 @@ This repo is a small toolkit for people who already play. It does not replace th
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser.
-2. Open a script file from this repo (or the raw URL).
-3. Tampermonkey should offer **Install**. If it does not, create a new script and paste the file in.
-4. Visit the matching Simcountry page while logged in. The extra UI appears on that page only.
+### Install Tampermonkey
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser (Chrome, Firefox, Edge, Safari, etc.).
+2. After install, the extension icon appears in the toolbar. Click it once to confirm it is active.
+
+### Install a script
+
+1. Open one of the raw URLs below (or click a script name in the table).
+2. Tampermonkey should detect the userscript header and offer an **Install** button. Click it.
+3. If the install prompt does not appear, open Tampermonkey → Dashboard → Utilities → Import from URL, paste the raw URL, and install. Or create a new script and paste the full file contents.
+4. Visit the matching Simcountry page while logged in. The extra UI appears only on that page (or family of pages).
+
+### Update a script
+
+- Tampermonkey can check for updates if the script has an `@updateURL` (these do not). The simplest update is to reinstall from the current raw URL: open the raw link again and click Install (it will replace the existing copy).
+- You can also open the installed script in the Tampermonkey editor, delete everything, paste the new file, and save.
+- After an update, reload the Simcountry page. Preferences stored in Tampermonkey / `localStorage` usually survive.
 
 Raw files:
 
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Loan%20Offers.js`
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Order%20Strategies`
-- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Salary%20Tweaks`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Corporation%20Toolbox.js`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Trading%20Toolbox.js`
+- `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Profession%20Toolbox.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Portal.js`
 - `https://github.com/WalkingGlitch/Simcountry/raw/main/scripts/Simcountry%20Cash%20Log%20%E2%80%94%20endless%2C%20sort%2C%20filter`
 
@@ -67,66 +82,83 @@ Interest rates stay world-controlled. The script only fills amount, period, and 
 
 ---
 
-## Order Strategy Toolbox
+## Corporation Toolbox
 
-**File:** [`Order Strategies`](scripts/Order%20Strategies) *(no `.js` extension; Tampermonkey still accepts it)*  
+**File:** [`Corporation Toolbox.js`](scripts/Corporation%20Toolbox.js)  
+**Userscript name:** Simcountry Corporation Toolbox  
 **Author:** TheWalkingGlitch  
-**Runs on:** Country → Trade → **Order Strategies** (`form name="fSOS"`)
+**Runs on:** corporation list pages (`ownedcompanies`) and strategy forms (`statecmpsalaries`, `statecmptradestrat`, quality of supplies, profit/cash/debt, offer/retract production, production contracts, retract material orders, review/cancel corporation contracts, and other `statecmp*` tables with numeric fields). Country/world trading pages belong in the Trading Toolbox.
 
-Stock order strategies are a long grid of products. The toolbox is a floating panel on that page. Selection is a checkbox to the left of each industry icon — sorting the list does not change what is checked.
+A single floating panel for corporation lists and the various strategy forms. Checkboxes select rows. Sorting and filters only reflow the live tables. Apply writes the form fields; the site's own save button is what actually persists changes. Bookmarks on list pages are scoped per country or enterprise.
 
 Screenshot: none yet.
 
 ### Features
 
-- Checkbox-select products, then apply values only to the checked set
-- Search, category chips, and field filters (quality, low-water, order qty, OS mode)
-- Reorder the live list without touching the site's save button
-- Bulk fill **low-water**, **order quantity**, and **quality** (clamped to 120–330)
-- Quality offset (`+` / `−`) for nudging a selection
-- Modes: auto, months, units, or off — auto falls back when a product has no months strategy
-- Presets:
-  - Economy `3 / 14 @ 120`
-  - Stockpile `8 / 24 @ 160`
-  - Military `6 / 18` at quality cap
-  - Civilian `3 / 14 @ 120`
-- Named **revisions**: save the current page (or only checked rows), restore later
-- Restore matches by product id first, then name + category, then unique name. New products on the page are left alone; missing saved ids are skipped.
+- Checkbox to the left of each product icon; checked rows highlight
+- Search by name, plus category and product-type filters that apply across every list on the page (including public and enterprise corps)
+- Range filters for salary, target, welfare, hiring, production, value, unsold, supplies, etc. (fields appear according to the page)
+- Selection helpers: check visible, uncheck all, invert visible, check military / industry / civilian
+- Mode-specific apply blocks (salary target/increase, trade strategies, supply quality, cash transfers, offer/retract, production contracts, retract orders, cancel contracts, generic field set/offset)
+- Named **revisions**: save all or only checked rows, restore later (matches by id first, then name + product)
+- Bookmarks on list pages (★ between Value and Unsold); country and enterprise lists stay separate
 - Draggable, collapsible panel
 
-Nothing is sent until you hit the site's own save button.
+Nothing is sent until you hit the site's save / submit button. Disable the older separate Salary Toolbox if both would run.
 
 ---
 
-## State Salary Toolbox
+## Trading Toolbox
 
-**File:** [`Salary Tweaks`](scripts/Salary%20Tweaks) *(no `.js` extension; Tampermonkey still accepts it)*  
-**Userscript name:** Simcountry State Salary Toolbox  
+**File:** [`Trading Toolbox.js`](scripts/Trading%20Toolbox.js)  
+**Userscript name:** Simcountry Trading Toolbox  
 **Author:** TheWalkingGlitch  
-**Runs on:** Country → Corporations → **Salary Levels** (`statecmpsalaries` / `stateCmpSalariesSubmit`)
+**Runs on:** country and enterprise trading pages (`tradeworldmarket` / `tradeownstockcorps` / `supplyownstockcorps`, `tradeprices`, `tradereq`, `stockorderstrategies`, `productutil`, `tradecontracts` / `tradecontractscancel`, `tradebycontract`, `tradecontractsign`). Corporation pages stay in the Corporation Toolbox.
 
-Same idea as the order-strategy toolbox, pointed at the state salary grid. Checkboxes select corporations. Sorting and filters only reflow the live list. Apply writes the form fields; the site button **Set Salary Changes** is what actually saves.
+Sort, filter, and select products on the trading tables. On order-strategy and common-market pages it can bulk-fill fields. On individual buy/sell order forms it adds Max / Min / Any / Best / Fixed helpers and remembers the last values per product.
 
-![Salary Tweaks toolbox on the salary-levels page](readmescreenshots/Salary%20Toolbox%20SS.png)
-*Salary Tweaks toolbox on the salary-levels page.*
+Screenshot: none yet.
 
 ### Features
 
-- Checkbox to the left of each product icon; checked rows highlight
-- Search by corporation name, plus category and product-type dropdowns
-- Range filters for current salary, target, welfare index, and hiring
-- Filter by strategy mode (target index vs increase)
-- Selection helpers: check visible, uncheck all, invert visible, check military / industry / civilian
-- Bulk apply to the checked set:
-  - **Target index** (default 300) or **Increase %**
-  - **Target 300** shortcut
-  - **Target = current** copies each corp's current salary into its target
-- Covers State Corporations, National Industries, and Country Controlled / Public Corporations on the same page
-- Named **revisions**: save all or only checked rows, restore later
-- Restore matches by corporation id first, then name + product, then unique name. Corps added after the snapshot are left alone.
+- Checkbox selection on product rows; sorting and filters only hide/reorder the live list
+- Search, category (military/industry/civilian + industry icons), and product-type filters
+- Extra filters by page: quality, stock, surplus, amount, market situation (shortage/surplus/balanced), order mode, contract action, etc.
+- Sort by original order, name, price, quality, stock, use, amount, surplus, date, low-water, order months, market score, etc.
+- On order strategies: set quality (absolute or offset, clamped 120–330), low-water months, order months, order mode, quality mode; apply to checked
+- On common-market contracts: set action (skip / local / common / both / cancel all)
+- Named revisions on strategy and common pages
+- Order-form helpers: Max quantity (from allotment warning or page amounts), quality Min/Max/Any, price Best/Fixed; per-product memory of last qty/quality/price/strategy
 - Draggable, collapsible panel
 
-Nothing is sent until you hit **Set Salary Changes**.
+Apply fills the form. Save with the site button. Disable the old stock-order-strategies script if both would run.
+
+---
+
+## Profession Toolbox
+
+**File:** [`Profession Toolbox.js`](scripts/Profession%20Toolbox.js)  
+**Userscript name:** Simcountry Profession Toolbox  
+**Author:** TheWalkingGlitch  
+**Runs on:** the Change profession page (`cexchworkers`)
+
+Prefills the profession-change form, merges data from the other labor tabs (employment, unemployed, retired, disabled, exchange), and offers presets plus one-click convert. It also publishes a structured export (`unsafeWindow.scProfessionExport` or the `sc-profession-export` event) for a later graph scraper. Injected UI is marked `data-sc-prof-ui="1"`.
+
+Screenshot: none yet.
+
+### Features
+
+- Combined employment table with unemployed, employed, total, reserved, needed, available, avail %, gap (plus columns from fetched tabs)
+- Click a number to prefill quantity + from/to professions (respects monthly remainder)
+- Step buttons (+1k / +5k / +10k / +25k / +100k) that stop at the monthly cap
+- Built-in presets (cover largest worker gap, surplus managers/high-tech/education/health to workers) plus custom presets
+- Allocation floor: leave enough to fill the profession's own need, or match highest/lowest worker availability %
+- One-click convert: arm professions so a clicked number submits immediately into the most-needed worker type
+- Monthly quota display (used / cap / remaining)
+- Fetches the other labor tabs itself and merges the numbers
+- Draggable, collapsible panel
+
+The script never clicks graph links. A companion can read the export and open them.
 
 ---
 
@@ -249,11 +281,12 @@ Each file is a shaded whole-world map from the morning of 9 Oct 2026 (Central). 
 ```
 Simcountry/
 ├── scripts/
+│   ├── Corporation Toolbox.js
 │   ├── Loan Offers.js
-│   ├── Order Strategies
 │   ├── Portal.js
-│   ├── Salary Tweaks
-│   └── Simcountry Cash Log — endless, sort, filter
+│   ├── Profession Toolbox.js
+│   ├── Simcountry Cash Log — endless, sort, filter
+│   └── Trading Toolbox.js
 ├── readmescreenshots/
 │   ├── LoanOffersjs Example Screenshot.png
 │   ├── Portaljs Example Screenshot.png
@@ -283,9 +316,9 @@ Simcountry/
 
 - These scripts scrape and click the live site. A game update can break them overnight.
 - They are client-side only. They do not talk to a third-party server.
-- First-party userscripts now live under `scripts/`. Raw install URLs changed with that move. Existing Tampermonkey copies need the new raw link (or a reinstall from the file) if they were pointed at the old root path.
+- First-party userscripts live under `scripts/`.
 - Batch loan submits reload the offer page once per offer, with a delay. Do not walk away from a 50-offer job if you care about the result.
-- Order-strategy and salary revisions live in userscript storage. Export nothing you cannot rebuild.
+- Corporation, trading, and profession revisions / bookmarks / presets live in userscript storage. Export nothing you cannot rebuild.
 - Portal sort order is local to that browser. It will not follow you to another machine.
 - Cash Log paints on the finance cash tab. The same script also paints on trade sales (`tsl`) and purchases (`tbl`). Load older follows a next link already in the response — the cash-log applet link, or the trade Next control — and stops at the row cap (default 1000). It does not invent page parameters.
 - `External Tools/csv-viewer.html` opens a local CSV in the browser. Caps, sort, filter, and find/replace stay on that page. The original file is not changed until you export.
@@ -310,3 +343,14 @@ Issues and PRs are welcome, especially:
 - Safer defaults for repeat-submit and quality clamps
 
 Keep changes scoped to one page family at a time. The game's markup is old and specific; broad refactors tend to miss a country vs enterprise variant.
+
+---
+
+## Deprecated scripts
+
+These older scripts have been removed. Uninstall them from Tampermonkey if you still have them, and install the replacements:
+
+- **Order Strategies** (and any "Order Strategy Toolbox") → replaced by **Trading Toolbox.js**. The new script covers the order-strategies page plus the rest of the country/enterprise trading pages, and adds order-form helpers.
+- **Salary Tweaks** (and any "State Salary Toolbox") → replaced by **Corporation Toolbox.js**. The new script covers salary levels plus the other corporation list and strategy forms, and adds bookmarks.
+
+If both an old script and its replacement are installed, disable or remove the old one so they do not fight over the same page.
