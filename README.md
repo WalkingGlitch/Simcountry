@@ -10,7 +10,7 @@ This repo is a small toolkit for people who already play. It does not replace th
 
 | Script | Version | What it does |
 | --- | --- | --- |
-| [Galaxy Console.js](scripts/Galaxy%20Console.js) | 3.0.7 | CentauDos galaxy viewer and console: shuttle register, event log, flights, markets, docking, and gated writes |
+| [Galaxy Console.js](scripts/Galaxy%20Console.js) | 3.1.6 | CentauDos galaxy viewer and console: shuttle register, event log, flights, markets, docking, and gated writes |
 | [Loan Offers.js](scripts/Loan%20Offers.js) | 1.5.0 | Sort, filter, highlight, total, and batch-submit loan offers |
 | [Corporation Toolbox.js](scripts/Corporation%20Toolbox.js) | 2.4.1 | Unified sort/filter/select/apply for corporation lists and strategy forms |
 | [Trading Toolbox.js](scripts/Trading%20Toolbox.js) | 1.2.5 | Sort, filter, select, and bulk-edit country and enterprise trading pages |
