@@ -8,6 +8,8 @@ This repo is a small toolkit for people who already play. It does not replace th
 [![Userscripts](https://img.shields.io/badge/requires-Tampermonkey-black.svg)](https://www.tampermonkey.net/)
 [![Game](https://img.shields.io/badge/game-Simcountry-0b5cab.svg)](https://www.simcountry.com/)
 
+# DO NOT USE THE GALAXY CONSOLE SCRIPT UNTIL IT HAS BEEN UPDATED PAST VERSION 3.1.6, IT CONTAINS A CRITICAL BUG THAT CAUSES MASSIVE EXCESSIVE NETWORK REQUESTS TO THE SERVERS. I AM WORKING WITH THE ADMINS TO FIX THIS. YOU WILL BE IP AUTO-BANNED IF YOU USE IT, YOU HAVE BEEN WARNED!
+
 | Script | Version | What it does |
 | --- | --- | --- |
 | [Galaxy Console.js](scripts/Galaxy%20Console.js) | 3.1.6 | CentauDos galaxy viewer and console: shuttle register, event log, flights, markets, docking, and gated writes |
